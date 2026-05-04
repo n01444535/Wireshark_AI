@@ -1,0 +1,33 @@
+# Network capture data — never commit real traffic
+*.pcap
+*.pcapng
+*.cap
+
+# Runtime output — generated per session, may contain network metadata
+results/*
+!results/.gitkeep
+history/*
+!history/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+MyEnv/
+venv/
+env/
+.venv/
+
+# macOS
+.DS_Store
+
+# Claude Code workspace settings
+.claude/
+
+# IDE
+.vscode/
+.idea/
