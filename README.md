@@ -30,7 +30,7 @@ Every suspicious detection prints a structured SOC alert block:
 [2026-05-04 21:04:32] ALERT — HIGH
 ────────────────────────────────────────────────────────
 Threat   : SYN Flood Suspected  [T1498.001]
-Source   : 192.168.1.10
+Source   : 192.168.xxx.xxx
 Severity : HIGH
 Evidence :
   - SYN ratio: 0.78
@@ -38,8 +38,8 @@ Evidence :
   - Packets: 342
 
 Top Flows:
-  1. 192.168.1.10 → 192.168.1.1  [TCP, 120 pkts]
-     Filter: ip.src == 192.168.1.10 && ip.dst == 192.168.1.1
+  1. 192.168.xxx.xxx → 192.168.xxx.xxx  [TCP, 120 pkts]
+     Filter: ip.src == 192.168.xxx.xxx && ip.dst == 192.168.xxx.xxx
 ════════════════════════════════════════════════════════
 ```
 
@@ -55,7 +55,7 @@ Every alert is appended to `logs/siem.log` in CSV format for integration with ex
 
 ```
 timestamp,alert_type,severity,mitre_id,src_ips,dst_ips,packets,window_start,window_end
-2026-05-04T21:04:32,SYN Flood Suspected,HIGH,T1498.001,192.168.1.10,192.168.1.1,342,...
+2026-05-04T21:04:32,SYN Flood Suspected,HIGH,T1498.001,192.168.xxx.xxx,192.168.xxx.xxx,342,...
 ```
 
 ### Detection Architecture
@@ -150,7 +150,7 @@ Apply a Wireshark display filter when reading (filters which packets are loaded)
 
 ```
 python3 main.py --pcap capture.pcap --filter "tcp"
-python3 main.py --pcap capture.pcap --filter "ip.addr == 192.168.1.5"
+python3 main.py --pcap capture.pcap --filter "ip.addr == 192.168.xxx.xxx"
 python3 main.py --pcap capture.pcap --filter "dns or http"
 ```
 
@@ -259,8 +259,8 @@ Wireshark filter:  dns
 Windows searched:  20  |  Matching flows: 3  |  Packets: 45  |  Bytes: 2700
 Conversations:
   1. [14:22:10-14:22:20] NORMAL
-     192.168.1.5:54321 -> 8.8.8.8:53 DNS | packets=20 bytes=1200 syn=0 rst=0 risk=10.00
-        Wireshark filter: ip.src == 192.168.1.5 && ip.dst == 8.8.8.8 && udp.dstport == 53
+     192.168.xxx.xxx:54321 -> 8.8.8.8:53 DNS | packets=20 bytes=1200 syn=0 rst=0 risk=10.00
+        Wireshark filter: ip.src == 192.168.xxx.xxx && ip.dst == 8.8.8.8 && udp.dstport == 53
 ```
 
 **No match:**
@@ -309,8 +309,8 @@ Statistics:
 Expert Info:
   [Inference] possible port scan pattern
 Conversations:
-  1. 10.0.0.4:49152 -> 10.0.0.1:22 TCP | packets=20 bytes=1200 syn=20 rst=0 risk=52.00
-     Wireshark filter: ip.src == 10.0.0.4 && ip.dst == 10.0.0.1 && tcp.srcport == 49152 && tcp.dstport == 22
+  1. 10.xxx.xxx.xxx:49152 -> 10.xxx.xxx.xxx:22 TCP | packets=20 bytes=1200 syn=20 rst=0 risk=52.00
+     Wireshark filter: ip.src == 10.xxx.xxx.xxx && ip.dst == 10.xxx.xxx.xxx && tcp.srcport == 49152 && tcp.dstport == 22
 ```
 
 ---
