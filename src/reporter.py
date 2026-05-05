@@ -4,6 +4,15 @@ from datetime import datetime
 
 from src.intelligence import ranked_flow_to_filter
 
+SIEM_LOG_PATH = "logs/siem.log"
+_SIEM_LOG_FIELDS = [
+    "timestamp", "alert_type", "severity", "mitre_id",
+    "src_ips", "dst_ips", "packets", "window_start", "window_end",
+]
+
+_SOC_SEPARATOR = "═" * 56
+_SOC_THIN_SEP  = "─" * 56
+
 
 # CSV column order for persisted window summaries. / Thứ tự cột CSV cho các summary theo window.
 CSV_FIELDS = [
@@ -82,7 +91,28 @@ def print_baseline_ready(window_end):
     print(f"[{format_clock(window_end)}] Baseline model trained.")
 
 
-# Print one post-warmup detection result. / In một kết quả detection sau giai đoạn warmup.
+def _build_alert_evidence(window_feature_values):
+    fv = window_feature_values
+    lines = []
+    syn_ratio = fv.get("syn_ratio", 0)
+    if syn_ratio > 0.1:
+        lines.append(f"SYN ratio: {syn_ratio:.2f}")
+    unique_dst_ips = int(fv.get("unique_dst_ips", 0))
+    if unique_dst_ips > 1:
+        lines.append(f"Unique destinations: {unique_dst_ips}")
+    unique_dst_ports = int(fv.get("unique_dst_ports", 0))
+    if unique_dst_ports > 3:
+        lines.append(f"Destination ports: {unique_dst_ports}")
+    arp_grat = fv.get("arp_gratuitous_ratio", 0)
+    if arp_grat > 0.05:
+        lines.append(f"Gratuitous ARP ratio: {arp_grat:.2f}")
+    arp_max = int(fv.get("arp_max_ips_per_mac", 0))
+    if arp_max > 1:
+        lines.append(f"Max IPs per MAC: {arp_max}")
+    lines.append(f"Packets: {int(fv.get('packets', 0))}")
+    return lines
+
+
 def print_detection(
     window_end,
     window_feature_values,
@@ -92,26 +122,71 @@ def print_detection(
     display_top_flows=5,
     alert_severity=None,
 ):
-    if window_label == "suspicious":
-        severity_tag = f"[{alert_severity}] " if alert_severity else ""
-        banner = f"{severity_tag}ALERT"
-    else:
-        banner = "NORMAL"
-    print(f"\n[{format_clock(window_end)}] {banner} | Packets={window_feature_values['packets']}")
-    print(f"Threat: {inference_summary}")
+    from src.triage import get_mitre_id
+
+    if window_label != "suspicious":
+        pkts = window_feature_values.get("packets", 0)
+        flows = window_feature_values.get("unique_flows", 0)
+        print(f"[{format_clock(window_end)}] NORMAL | Packets={pkts} | Flows={flows}")
+        return
+
+    severity = alert_severity or "LOW"
+    threat_text = inference_summary.replace("[Inference] ", "").replace("[Inference]", "").strip()
+    mitre_id = get_mitre_id(threat_text)
+    mitre_tag = f"  [{mitre_id}]" if mitre_id else ""
+
+    src_ips = list({f.source_ip for f in ranked_flow_summaries if f.source_ip not in {"unknown", ""}})[:3]
+    src_display = ", ".join(src_ips) if src_ips else "unknown"
+
+    evidence_lines = _build_alert_evidence(window_feature_values)
+    ts = datetime.fromtimestamp(window_end).strftime("%Y-%m-%d %H:%M:%S")
+
+    print(f"\n{_SOC_SEPARATOR}")
+    print(f"[{ts}] ALERT — {severity}")
+    print(_SOC_THIN_SEP)
+    print(f"Threat   : {threat_text}{mitre_tag}")
+    print(f"Source   : {src_display}")
+    print(f"Severity : {severity}")
+    if evidence_lines:
+        print("Evidence :")
+        for line in evidence_lines:
+            print(f"  - {line}")
+
     top_flows = ranked_flow_summaries[:display_top_flows]
     if top_flows:
-        print("Findings:")
+        print("\nTop Flows:")
         for i, flow in enumerate(top_flows, 1):
-            if flow.first_frame > 0:
-                if flow.first_frame == flow.last_frame:
-                    frame_info = f" | frame #{flow.first_frame}"
-                else:
-                    frame_info = f" | frames #{flow.first_frame}-#{flow.last_frame}"
-            else:
-                frame_info = ""
-            print(f"  {i}. {flow.source_ip} -> {flow.destination_ip} | {flow.protocol_name}{frame_info}")
+            print(f"  {i}. {flow.source_ip} → {flow.destination_ip}  [{flow.protocol_name}, {flow.packet_count} pkts]")
             print(f"     Filter: {ranked_flow_to_filter(flow)}")
+    print(_SOC_SEPARATOR)
+
+
+def write_siem_log(siem_log_path, window_start, window_end, alert_type, severity, mitre_id, ranked_flow_summaries, packets):
+    log_dir = os.path.dirname(siem_log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    src_ips = "|".join(sorted({f.source_ip for f in ranked_flow_summaries if f.source_ip not in {"unknown", ""}}))
+    dst_ips = "|".join(sorted({f.destination_ip for f in ranked_flow_summaries if f.destination_ip not in {"unknown", ""}}))
+
+    row = {
+        "timestamp":    datetime.now().isoformat(),
+        "alert_type":   alert_type,
+        "severity":     severity,
+        "mitre_id":     mitre_id,
+        "src_ips":      src_ips,
+        "dst_ips":      dst_ips,
+        "packets":      int(packets),
+        "window_start": datetime.fromtimestamp(window_start).isoformat(),
+        "window_end":   datetime.fromtimestamp(window_end).isoformat(),
+    }
+
+    write_header = not os.path.exists(siem_log_path) or os.path.getsize(siem_log_path) == 0
+    with open(siem_log_path, "a", newline="") as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=_SIEM_LOG_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 # Append one analyzed window to CSV output. / Ghi thêm một window đã phân tích vào file CSV.

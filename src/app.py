@@ -20,11 +20,16 @@ from src.intelligence import (
     format_inference_statement,
 )
 from src.parser import parse_tshark_csv_line
-from src.reporter import format_empty_window, print_baseline_ready, print_detection, print_warmup, write_row
+from src.reporter import format_empty_window, print_baseline_ready, print_detection, print_warmup, write_row, write_siem_log, SIEM_LOG_PATH
 
 
-def _rule_based_label(window_feature_values):
-    """Return 'suspicious' if any high-confidence attack signature is present."""
+SYN_FLOOD_SYN_RATIO_THRESHOLD = 0.5
+SYN_FLOOD_MIN_DEST_IPS = 5
+PORT_SCAN_MIN_DST_PORTS = 15
+SUSPICIOUS_SERVICE_PORTS = {22, 3389, 445}
+
+
+def _rule_based_label(window_feature_values, ranked_flow_summaries=None):
     fv = window_feature_values
     if fv.get("http_ics_path_hit", 0):
         return "suspicious"
@@ -42,6 +47,20 @@ def _rule_based_label(window_feature_values):
         and fv.get("unique_flows", 0) > 8
     ):
         return "suspicious"
+    if (
+        fv.get("syn_ratio", 0) > SYN_FLOOD_SYN_RATIO_THRESHOLD
+        and fv.get("unique_dst_ips", 0) > SYN_FLOOD_MIN_DEST_IPS
+    ):
+        return "suspicious"
+    if fv.get("unique_dst_ports", 0) > PORT_SCAN_MIN_DST_PORTS:
+        return "suspicious"
+    if ranked_flow_summaries:
+        for flow in ranked_flow_summaries:
+            if (
+                flow.destination_port in SUSPICIOUS_SERVICE_PORTS
+                or flow.source_port in SUSPICIOUS_SERVICE_PORTS
+            ):
+                return "suspicious"
     return "normal"
 
 
@@ -87,6 +106,24 @@ def _derive_suspicious_reason(window_feature_values, ranked_flow_summaries):
             " — automated network sweep (nmap -sn or Ettercap host scan after initial compromise)"
         )
 
+    # SYN Flood: high SYN ratio targeting many destinations
+    syn_ratio = fv.get("syn_ratio", 0)
+    if syn_ratio > SYN_FLOOD_SYN_RATIO_THRESHOLD and unique_dsts > SYN_FLOOD_MIN_DEST_IPS:
+        return (
+            f"SYN Flood Suspected: SYN ratio {syn_ratio:.2f},"
+            f" {int(unique_dsts)} destination IPs targeted"
+            " — TCP connection flood, possible DoS attack"
+        )
+
+    # Port Scan: many destination ports with few packets per flow
+    unique_dst_ports = int(fv.get("unique_dst_ports", 0))
+    if unique_dst_ports > PORT_SCAN_MIN_DST_PORTS:
+        avg_pkts = fv.get("mean_packets_per_flow", 0)
+        return (
+            f"Port Scan: {unique_dst_ports} destination ports probed"
+            f" (avg {avg_pkts:.1f} pkts/flow) — service discovery sweep"
+        )
+
     for flow in ranked_flow_summaries:
         proto = flow.protocol_name.upper()
         if proto in {"SSH", "SSHV2"}:
@@ -105,6 +142,16 @@ def _derive_suspicious_reason(window_feature_values, ranked_flow_summaries):
             return "RDP Exposure: Remote desktop traffic — verify for brute force or unauthorized access"
         if proto == "SMB":
             return "SMB Activity: File-sharing traffic — check for lateral movement or ransomware staging"
+
+        # Port-based detection when protocol label is generic (e.g., TCP)
+        _SERVICE_PORT_LABELS = {22: "SSH", 3389: "RDP", 445: "SMB"}
+        for svc_port, svc_name in _SERVICE_PORT_LABELS.items():
+            if flow.destination_port == svc_port or flow.source_port == svc_port:
+                return (
+                    f"Suspicious Service Access: {svc_name} (port {svc_port})"
+                    f" connection {flow.source_ip} → {flow.destination_ip}"
+                    " — verify for unauthorized access or brute force"
+                )
 
     unique_src = fv.get("unique_src_ips", 0)
     if unique_src > 5 and fv.get("syn_ratio", 0) > 0.3:
@@ -137,6 +184,7 @@ _HIGH_SEVERITY_REASON_PREFIXES = (
     "ICS/HMI Web Reconnaissance",
     "Cleartext Protocol",
     "SSH Brute Force",
+    "SYN Flood",
 )
 
 _MEDIUM_SEVERITY_REASON_PREFIXES = (
@@ -146,6 +194,8 @@ _MEDIUM_SEVERITY_REASON_PREFIXES = (
     "RDP Exposure",
     "Possible DDoS",
     "SMB Activity",
+    "Port Scan",
+    "Suspicious Service Access",
 )
 
 
@@ -463,7 +513,7 @@ class LiveTrafficMLApp:
                 self.fit_model()
 
             # Apply rule-based detection even during warmup so attacks aren't silently swallowed.
-            early_label = _rule_based_label(window_feature_values)
+            early_label = _rule_based_label(window_feature_values, ranked_flow_summaries)
             early_severity = None
             if early_label == "suspicious":
                 raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
@@ -479,6 +529,13 @@ class LiveTrafficMLApp:
                         display_top_flows=self.display_top_flows,
                         alert_severity=early_severity,
                     )
+                from src.triage import get_mitre_id
+                write_siem_log(
+                    SIEM_LOG_PATH, window_start, window_end,
+                    raw_inference_summary, early_severity or "LOW",
+                    get_mitre_id(raw_inference_summary),
+                    ranked_flow_summaries, window_feature_values.get("packets", 0),
+                )
             else:
                 if self.should_print_window_events():
                     print_warmup(window_end, window_feature_values, remaining_warmup_window_count)
@@ -513,7 +570,7 @@ class LiveTrafficMLApp:
         window_label = "suspicious" if model_prediction == -1 else "normal"
         # Rule-based overrides — certain attack signatures always force suspicious.
         if window_label == "normal":
-            window_label = _rule_based_label(window_feature_values)
+            window_label = _rule_based_label(window_feature_values, ranked_flow_summaries)
         if window_label == "suspicious" and raw_inference_summary == "traffic within learned baseline":
             # Keep suspicious model output from sounding normal. / Tránh output suspicious nhưng summary lại nghe như normal.
             raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
@@ -528,6 +585,14 @@ class LiveTrafficMLApp:
                 labeled_inference_summary,
                 display_top_flows=self.display_top_flows,
                 alert_severity=alert_severity,
+            )
+        if window_label == "suspicious":
+            from src.triage import get_mitre_id
+            write_siem_log(
+                SIEM_LOG_PATH, window_start, window_end,
+                raw_inference_summary, alert_severity or "LOW",
+                get_mitre_id(raw_inference_summary),
+                ranked_flow_summaries, window_feature_values.get("packets", 0),
             )
         self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity)
         self.memory.add_window(
@@ -801,7 +866,7 @@ class PcapTrafficMLApp:
                 self._fit_model()
 
             # Apply rule-based detection even during warmup so attacks aren't silently swallowed.
-            early_label = _rule_based_label(window_feature_values)
+            early_label = _rule_based_label(window_feature_values, ranked_flow_summaries)
             early_severity = None
             if early_label == "suspicious":
                 raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
@@ -815,6 +880,13 @@ class PcapTrafficMLApp:
                     labeled_inference_summary,
                     display_top_flows=self.display_top_flows,
                     alert_severity=early_severity,
+                )
+                from src.triage import get_mitre_id
+                write_siem_log(
+                    SIEM_LOG_PATH, window_start, window_end,
+                    raw_inference_summary, early_severity or "LOW",
+                    get_mitre_id(raw_inference_summary),
+                    ranked_flow_summaries, window_feature_values.get("packets", 0),
                 )
             self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity)
             self.memory.add_window(TrafficWindow(
@@ -832,7 +904,7 @@ class PcapTrafficMLApp:
         window_label = "suspicious" if prediction == -1 else "normal"
         # Rule-based overrides — certain attack signatures always force suspicious.
         if window_label == "normal":
-            window_label = _rule_based_label(window_feature_values)
+            window_label = _rule_based_label(window_feature_values, ranked_flow_summaries)
         if window_label == "suspicious" and raw_inference_summary == "traffic within learned baseline":
             raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
         labeled_inference_summary = format_inference_statement(raw_inference_summary)
@@ -846,6 +918,13 @@ class PcapTrafficMLApp:
                 labeled_inference_summary,
                 display_top_flows=self.display_top_flows,
                 alert_severity=alert_severity,
+            )
+            from src.triage import get_mitre_id
+            write_siem_log(
+                SIEM_LOG_PATH, window_start, window_end,
+                raw_inference_summary, alert_severity or "LOW",
+                get_mitre_id(raw_inference_summary),
+                ranked_flow_summaries, window_feature_values.get("packets", 0),
             )
         self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity)
         self.memory.add_window(TrafficWindow(

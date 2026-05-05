@@ -4,6 +4,81 @@ Captures or reads network traffic, learns a baseline, detects anomalies, and ans
 
 ---
 
+## SOC Use Cases
+
+This system is designed to support real Security Operations Center (SOC) workflows. It combines **rule-based detection** with **ML anomaly scoring** — the same hybrid approach used in production SIEM platforms.
+
+| Scenario | Detection Method | MITRE ATT&CK |
+|----------|-----------------|--------------|
+| SYN Flood / DoS attack | High SYN ratio + many destination IPs | T1498.001 |
+| Port scanning activity | Many destination ports + short-lived flows | T1046 |
+| Suspicious service access (SSH/RDP/SMB) | Connections to critical ports 22, 3389, 445 | T1021 |
+| ARP cache poisoning / MiTM | Gratuitous ARP flood, MAC claiming multiple IPs | T1557.002 |
+| Lateral movement / host sweep | Fan-out to many hosts with few packets per flow | T1021 |
+| ICS/SCADA HMI reconnaissance | HTTP access to industrial control endpoints | T1071.001 |
+| Brute force (SSH/RDP) | High SYN rate, all connections rejected | T1110 |
+| Cleartext credential exposure | Telnet protocol detected | T1040 |
+| Data exfiltration | Large outbound packets to external IPs | T1041 |
+| Distributed SYN flood (DDoS) | Many source IPs all sending SYN | T1498.001 |
+
+### Alert Output Format
+
+Every suspicious detection prints a structured SOC alert block:
+
+```
+════════════════════════════════════════════════════════
+[2026-05-04 21:04:32] ALERT — HIGH
+────────────────────────────────────────────────────────
+Threat   : SYN Flood Suspected  [T1498.001]
+Source   : 192.168.1.10
+Severity : HIGH
+Evidence :
+  - SYN ratio: 0.78
+  - Unique destinations: 45
+  - Packets: 342
+
+Top Flows:
+  1. 192.168.1.10 → 192.168.1.1  [TCP, 120 pkts]
+     Filter: ip.src == 192.168.1.10 && ip.dst == 192.168.1.1
+════════════════════════════════════════════════════════
+```
+
+Normal windows produce a single quiet line:
+
+```
+[21:04:42] NORMAL | Packets=87 | Flows=12
+```
+
+### SIEM-Style Log
+
+Every alert is appended to `logs/siem.log` in CSV format for integration with external SIEM tools:
+
+```
+timestamp,alert_type,severity,mitre_id,src_ips,dst_ips,packets,window_start,window_end
+2026-05-04T21:04:32,SYN Flood Suspected,HIGH,T1498.001,192.168.1.10,192.168.1.1,342,...
+```
+
+### Detection Architecture
+
+```
+Packet stream
+     │
+     ▼
+Rule-based engine ──► Immediate flag for known attack signatures
+     │                (ARP poisoning, ICS recon, SYN flood, port scan)
+     ▼
+ML anomaly scorer ──► IsolationForest trained on baseline traffic
+     │                (catches unknown patterns the rules miss)
+     ▼
+Triage engine ──► Scores evidence, classifies TP vs FP
+                  (external IP +pts, business hours -pts, etc.)
+     │
+     ▼
+SIEM-style alert (HIGH / MEDIUM / LOW) + MITRE ATT&CK mapping
+```
+
+---
+
 ## Requirements
 
 - Python 3.9+
@@ -307,14 +382,17 @@ Press `Ctrl+C` to stop, or type `quit` / `exit` / `stop` at the question prompt.
 ```
 main.py
 src/
-  app.py          — live capture app + pcap analysis app
+  app.py          — live capture app + pcap analysis app (rule-based + ML hybrid)
   capture.py      — tshark process wrapper
   config.py       — CLI argument definitions
   features.py     — packet-to-feature conversion
   intelligence.py — question routing and answer formatting
   models.py       — data classes
   parser.py       — tshark CSV line parser
-  reporter.py     — terminal and CSV output
+  reporter.py     — SOC alert output, CSV, and SIEM log writer
+  triage.py       — alert triage engine with MITRE ATT&CK mapping
 results/
-  live_traffic_windows.csv   — default CSV output
+  live_traffic_windows.csv   — default CSV output per window
+logs/
+  siem.log                   — SIEM-style alert log (appended each session)
 ```

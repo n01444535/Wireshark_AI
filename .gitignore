@@ -6,6 +6,8 @@
 # Runtime output — generated per session, may contain network metadata
 results/*
 !results/.gitkeep
+logs/*
+!logs/.gitkeep
 history/*
 !history/.gitkeep
 

@@ -1196,27 +1196,26 @@ class TrafficAnswerEngine:
 
         shown_windows = suspicious_windows[-10:]
         lines = [
-            "=== Suspicious Traffic Detected ===",
-            f"Suspicious: {len(suspicious_windows)}  |  Normal: {len(model_scored_windows) - len(suspicious_windows)}  |  Total scored: {len(model_scored_windows)}",
+            "=== Suspicious Windows ===",
+            f"Suspicious: {len(suspicious_windows)}  |  Normal: {len(model_scored_windows) - len(suspicious_windows)}  |  Total: {len(model_scored_windows)}",
         ]
         for alert_index, win in enumerate(shown_windows, 1):
             fv = win.window_feature_values
             reason = win.inference_summary.replace("[Inference] ", "").replace("[Inference]", "").strip()
-            protocols = _distinct_protocols_from_flows(win.ranked_flow_summaries)
             triage_result = self.triage_engine.triage(win)
             lines += [
                 "",
                 f"[Alert {alert_index}]  {_clock(win.window_start)} - {_clock(win.window_end)}",
-                f"  Threat:    {reason}",
-                f"  Triage:    {triage_result.one_liner()}",
-                f"  Packets:   {fv.get('packets', 0)}",
-                f"  Protocols: {protocols or 'none'}",
+                f"  Risk:    {triage_result.one_liner()}",
+                f"  Threat:  {reason}",
+                f"  Packets: {fv.get('packets', 0)}",
             ]
             if win.ranked_flow_summaries:
-                lines.append("  Findings:")
-                for finding_index, flow in enumerate(win.ranked_flow_summaries[:5], 1):
-                    lines.append(_format_finding(flow, finding_index))
-        lines.append("\nType 'triage' for full risk breakdown of each alert.")
+                lines.append("  Top flows:")
+                for flow in win.ranked_flow_summaries[:3]:
+                    lines.append(f"    • {flow.source_ip} → {flow.destination_ip}  [{flow.protocol_name}, {flow.packet_count} pkts]")
+                    lines.append(f"      Filter: {ranked_flow_to_filter(flow)}")
+        lines.append("\nType 'triage' for full evidence breakdown.")
         return "\n".join(lines)
 
     def answer_triage(self, analyzed_capture_windows):

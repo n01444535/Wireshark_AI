@@ -10,6 +10,34 @@ RISK_MEDIUM   = "MEDIUM"
 RISK_LOW      = "LOW"
 RISK_INFO     = "INFO"
 
+MITRE_ATTACK_MAP = {
+    "ARP Cache Poisoning":              "T1557.002",
+    "ICS/SCADA HMI Web Reconnaissance": "T1071.001",
+    "ICS/HMI Web Reconnaissance":       "T1071.001",
+    "Lateral Movement":                 "T1021",
+    "DDoS":                             "T1498.001",
+    "SYN Flood":                        "T1498.001",
+    "Port Scan":                        "T1046",
+    "Brute Force":                      "T1110",
+    "SSH Brute Force":                  "T1110",
+    "SSH Tunneling":                    "T1572",
+    "Cleartext Protocol":               "T1040",
+    "Suspicious Service Access":        "T1021",
+    "SMB Activity":                     "T1021.002",
+    "RDP Exposure":                     "T1021.001",
+    "Web Path Enumeration":             "T1595.003",
+    "ARP Host Discovery":               "T1018",
+    "Possible DDoS":                    "T1498.001",
+    "Statistical Anomaly":              "",
+}
+
+
+def get_mitre_id(threat_text: str) -> str:
+    for prefix, mitre_id in MITRE_ATTACK_MAP.items():
+        if threat_text.startswith(prefix):
+            return mitre_id
+    return ""
+
 _PRIVATE_NETWORKS = [
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -107,6 +135,29 @@ def _is_business_hours(unix_ts: float, start_hour: int, end_hour: int) -> bool:
     return start_hour <= dt.hour < end_hour and dt.weekday() < 5
 
 
+_BUSINESS_SERVER_PORTS = {25, 110, 143, 389, 445, 636, 1433, 1521, 3268, 3269}
+
+def _classify_network_type(fv, flows) -> str:
+    if fv.get("enip_ratio", 0) > 0:
+        return "ics"
+    flow_ports = set()
+    proto_names = set()
+    for f in flows:
+        if f.source_port:
+            flow_ports.add(f.source_port)
+        if f.destination_port:
+            flow_ports.add(f.destination_port)
+        proto_names.add(f.protocol_name.upper())
+    has_business_indicator = (
+        bool(flow_ports & _BUSINESS_SERVER_PORTS)
+        or bool(proto_names & {"SMB", "LDAP", "SYSLOG"})
+        or fv.get("unique_dst_ips", 0) > 20
+    )
+    if has_business_indicator:
+        return "business"
+    return "home"
+
+
 def _attempts_per_minute(syn_count: int, window_seconds: float) -> float:
     if window_seconds <= 0:
         return 0.0
@@ -136,6 +187,7 @@ class AlertTriageEngine:
         duration = max(1.0, traffic_window.window_end - traffic_window.window_start)
         is_biz = _is_business_hours(traffic_window.window_start, self.biz_start, self.biz_end)
 
+        network_type = _classify_network_type(fv, flows)
         evidence: List[TriageEvidence] = []
         score = 0
 
@@ -177,23 +229,24 @@ class AlertTriageEngine:
             ))
             score += pts
 
-        # ── Time of day ─────────────────────────────────────────────────────
+        # ── Time of day (only meaningful for business/ICS networks) ────────
         dt = datetime.fromtimestamp(traffic_window.window_start)
-        if not is_biz:
-            pts = 15
-            evidence.append(TriageEvidence(
-                "Off-Hours Activity",
-                pts,
-                f"Detected at {dt.strftime('%H:%M')} — outside business hours ({self.biz_start}:00–{self.biz_end}:00 Mon–Fri)",
-            ))
-        else:
-            pts = -10
-            evidence.append(TriageEvidence(
-                "Business Hours",
-                pts,
-                f"Detected at {dt.strftime('%H:%M')} during working hours — user activity plausible",
-            ))
-        score += pts
+        if network_type != "home":
+            if not is_biz:
+                pts = 15
+                evidence.append(TriageEvidence(
+                    "Off-Hours Activity",
+                    pts,
+                    f"Detected at {dt.strftime('%H:%M')} — outside business hours ({self.biz_start}:00–{self.biz_end}:00 Mon–Fri)",
+                ))
+            else:
+                pts = -10
+                evidence.append(TriageEvidence(
+                    "Business Hours",
+                    pts,
+                    f"Detected at {dt.strftime('%H:%M')} during working hours — user activity plausible",
+                ))
+            score += pts
 
         # ── Attempt rate ─────────────────────────────────────────────────────
         total_syn = int(round(fv.get("syn_ratio", 0) * fv.get("packets", 0)))
@@ -457,7 +510,7 @@ class AlertTriageEngine:
 
         score = max(0, min(100, score))
         classification, recommendation = self._classify(
-            score, fv, flows, external, internal, is_biz, total_syn, unique_dst_ports
+            score, fv, flows, external, internal, is_biz, total_syn, unique_dst_ports, network_type
         )
 
         if score >= 75:
@@ -482,7 +535,7 @@ class AlertTriageEngine:
             window_end=traffic_window.window_end,
         )
 
-    def _classify(self, score, fv, flows, external, internal, is_biz, total_syn, unique_dst_ports):
+    def _classify(self, score, fv, flows, external, internal, is_biz, total_syn, unique_dst_ports, network_type="business"):
         unique_src = fv.get("unique_src_ips", 0)
         syn_ratio = fv.get("syn_ratio", 0)
         rst_ratio = fv.get("rst_ratio", 0)
@@ -539,6 +592,16 @@ class AlertTriageEngine:
                 " Cross-reference with IDS/EDR alerts on the suspected compromised host.",
             )
 
+        # SYN Flood — single source hammering many destinations
+        if syn_ratio > 0.5 and unique_dst_ips_c > 5 and unique_src <= 3:
+            src_desc = "External" if external else "Internal"
+            return (
+                "SYN Flood — Targeted DoS",
+                f"BLOCK and MONITOR — {src_desc} source sending high SYN volume (ratio {syn_ratio:.2f})"
+                f" to {unique_dst_ips_c} destinations. Possible DoS/DDoS attack."
+                " Block source IP at firewall. Check for amplification or botnet vectors.",
+            )
+
         # DDoS — many sources flooding SYN
         if unique_src > 10 and syn_ratio > 0.3:
             return (
@@ -571,8 +634,8 @@ class AlertTriageEngine:
                 "Check if IP is a known CDN, cloud service, or partner network.",
             )
 
-        # Internal, few attempts, business hours — classic user lockout
-        if internal and not external and total_syn <= 10 and is_biz:
+        # Internal, few attempts, business hours — classic user lockout (not applicable to home)
+        if network_type != "home" and internal and not external and total_syn <= 10 and is_biz:
             return (
                 "Likely User Lockout (Internal)",
                 "VERIFY with user/HR — probable forgotten password during work hours. "
@@ -604,8 +667,8 @@ class AlertTriageEngine:
                 "If unrecognized: block at perimeter and open a monitoring ticket.",
             )
 
-        # Internal, off-hours but low volume — abnormal timing
-        if internal and not external and not is_biz:
+        # Internal, off-hours but low volume — only flag for business/ICS networks
+        if network_type != "home" and internal and not external and not is_biz:
             return (
                 "Internal Off-Hours Activity — Abnormal Timing",
                 "INVESTIGATE — Internal traffic outside business hours. "
