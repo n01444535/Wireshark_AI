@@ -90,8 +90,13 @@ def print_detection(
     window_label,
     inference_summary,
     display_top_flows=5,
+    alert_severity=None,
 ):
-    banner = "SUSPICIOUS" if window_label == "suspicious" else "NORMAL"
+    if window_label == "suspicious":
+        severity_tag = f"[{alert_severity}] " if alert_severity else ""
+        banner = f"{severity_tag}ALERT"
+    else:
+        banner = "NORMAL"
     print(f"\n[{format_clock(window_end)}] {banner} | Packets={window_feature_values['packets']}")
     print(f"Threat: {inference_summary}")
     top_flows = ranked_flow_summaries[:display_top_flows]

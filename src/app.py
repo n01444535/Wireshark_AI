@@ -132,6 +132,35 @@ def _derive_suspicious_reason(window_feature_values, ranked_flow_summaries):
     return "Statistical Anomaly: Traffic pattern outside learned baseline — no single dominant indicator"
 
 
+_HIGH_SEVERITY_REASON_PREFIXES = (
+    "ARP Cache Poisoning",
+    "ICS/HMI Web Reconnaissance",
+    "Cleartext Protocol",
+    "SSH Brute Force",
+)
+
+_MEDIUM_SEVERITY_REASON_PREFIXES = (
+    "Lateral Movement",
+    "ARP Host Discovery",
+    "SSH Tunneling",
+    "RDP Exposure",
+    "Possible DDoS",
+    "SMB Activity",
+)
+
+
+def _classify_alert_severity(window_label, reason_text):
+    if window_label != "suspicious":
+        return None
+    for prefix in _HIGH_SEVERITY_REASON_PREFIXES:
+        if reason_text.startswith(prefix):
+            return "HIGH"
+    for prefix in _MEDIUM_SEVERITY_REASON_PREFIXES:
+        if reason_text.startswith(prefix):
+            return "MEDIUM"
+    return "LOW"
+
+
 def _save_to_history(history_filename, session_windows, session_source):
     if not session_windows:
         return
@@ -276,15 +305,18 @@ class LiveTrafficMLApp:
         scaled_warmup = self.scaler.transform(self.training_feature_vectors)
         self.model.fit(scaled_warmup)
 
-    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary):
+    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity=None):
         write_row(self.output_csv, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary)
-        self._session_windows.append({
+        window_entry = {
             "time": datetime.fromtimestamp(window_end).strftime("%H:%M:%S"),
             "label": window_label,
             "score": round(anomaly_score, 4),
             "summary": labeled_inference_summary,
             "features": window_feature_values,
-        })
+        }
+        if alert_severity:
+            window_entry["severity"] = alert_severity
+        self._session_windows.append(window_entry)
 
     def run(self):
         # Start tshark, then enter the live windowing loop. / Khởi động tshark rồi vào vòng lặp chia window live.
@@ -432,9 +464,11 @@ class LiveTrafficMLApp:
 
             # Apply rule-based detection even during warmup so attacks aren't silently swallowed.
             early_label = _rule_based_label(window_feature_values)
+            early_severity = None
             if early_label == "suspicious":
                 raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
                 labeled_inference_summary = format_inference_statement(raw_inference_summary)
+                early_severity = _classify_alert_severity(early_label, raw_inference_summary)
                 if self.should_print_window_events():
                     print_detection(
                         window_end,
@@ -443,6 +477,7 @@ class LiveTrafficMLApp:
                         "suspicious",
                         labeled_inference_summary,
                         display_top_flows=self.display_top_flows,
+                        alert_severity=early_severity,
                     )
             else:
                 if self.should_print_window_events():
@@ -451,7 +486,7 @@ class LiveTrafficMLApp:
                     if self.should_print_window_events():
                         print_baseline_ready(window_end)
 
-            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary)
+            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity)
             self.memory.add_window(
                 TrafficWindow(
                     window_start=window_start,
@@ -483,6 +518,7 @@ class LiveTrafficMLApp:
             # Keep suspicious model output from sounding normal. / Tránh output suspicious nhưng summary lại nghe như normal.
             raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
         labeled_inference_summary = format_inference_statement(raw_inference_summary)
+        alert_severity = _classify_alert_severity(window_label, raw_inference_summary)
         if self.should_print_window_events():
             print_detection(
                 window_end,
@@ -491,8 +527,9 @@ class LiveTrafficMLApp:
                 window_label,
                 labeled_inference_summary,
                 display_top_flows=self.display_top_flows,
+                alert_severity=alert_severity,
             )
-        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary)
+        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity)
         self.memory.add_window(
             TrafficWindow(
                 window_start=window_start,
@@ -733,15 +770,18 @@ class PcapTrafficMLApp:
             result.append((pkts, window_start, window_end))
         return result
 
-    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary):
+    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity=None):
         write_row(self.output_csv, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary)
-        self._session_windows.append({
+        window_entry = {
             "time": datetime.fromtimestamp(window_end).strftime("%H:%M:%S"),
             "label": window_label,
             "score": round(anomaly_score, 4),
             "summary": labeled_inference_summary,
             "features": window_feature_values,
-        })
+        }
+        if alert_severity:
+            window_entry["severity"] = alert_severity
+        self._session_windows.append(window_entry)
 
     def _process_window(self, packet_records, window_start, window_end):
         window_feature_values, ranked_flow_summaries, raw_inference_summary = build_window_feature_values(
@@ -762,10 +802,21 @@ class PcapTrafficMLApp:
 
             # Apply rule-based detection even during warmup so attacks aren't silently swallowed.
             early_label = _rule_based_label(window_feature_values)
+            early_severity = None
             if early_label == "suspicious":
                 raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
                 labeled_inference_summary = format_inference_statement(raw_inference_summary)
-            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary)
+                early_severity = _classify_alert_severity(early_label, raw_inference_summary)
+                print_detection(
+                    window_end,
+                    window_feature_values,
+                    ranked_flow_summaries,
+                    early_label,
+                    labeled_inference_summary,
+                    display_top_flows=self.display_top_flows,
+                    alert_severity=early_severity,
+                )
+            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity)
             self.memory.add_window(TrafficWindow(
                 window_start=window_start, window_end=window_end,
                 window_feature_values=window_feature_values,
@@ -785,8 +836,18 @@ class PcapTrafficMLApp:
         if window_label == "suspicious" and raw_inference_summary == "traffic within learned baseline":
             raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
         labeled_inference_summary = format_inference_statement(raw_inference_summary)
-
-        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary)
+        alert_severity = _classify_alert_severity(window_label, raw_inference_summary)
+        if window_label == "suspicious":
+            print_detection(
+                window_end,
+                window_feature_values,
+                ranked_flow_summaries,
+                window_label,
+                labeled_inference_summary,
+                display_top_flows=self.display_top_flows,
+                alert_severity=alert_severity,
+            )
+        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity)
         self.memory.add_window(TrafficWindow(
             window_start=window_start, window_end=window_end,
             window_feature_values=window_feature_values,
