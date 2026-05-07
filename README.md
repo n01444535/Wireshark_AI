@@ -102,6 +102,121 @@ Exactly one of `--interface` or `--pcap` is required.
 
 ---
 
+## Privacy / Sanitize Mode
+
+Replace all real IPs and MACs in output with anonymous aliases (`HOST_A`, `HOST_B`, ...):
+
+```
+python3 main.py --pcap capture.pcap --sanitize
+python3 main.py --pcap capture.pcap --sanitize --report results/report.md
+```
+
+Output becomes:
+
+```
+Threat   : Port Scan: 26 destination ports probed
+Source   : HOST_A
+Top flow : HOST_A → HOST_B  [TCP, 120 pkts]
+Filter   : ip.src == HOST_A && ip.dst == HOST_B
+```
+
+Combined with `--report`, the markdown file contains a full IP mapping table at the bottom (marked with a warning to remove before sharing externally).
+
+---
+
+## Markdown Report
+
+Export a full analysis report after pcap processing:
+
+```
+python3 main.py --pcap capture.pcap --report results/report.md
+python3 main.py --pcap capture.pcap --sanitize --report results/report.md
+```
+
+The report includes:
+- Executive summary table (windows, severity, top source, top detection)
+- Per-alert detail: evidence, MITRE ATT&CK link, baseline deviation, recommended actions
+- IP/MAC mapping table (sanitize mode only, marked private)
+
+---
+
+## Session Summary
+
+Printed automatically after every run (pcap completion or live `Ctrl+C`):
+
+```
+════════════════════════════════════════════════════════
+SESSION SUMMARY
+────────────────────────────────────────────────────────
+  Total windows    : 47
+  Normal           : 41
+  Suspicious       : 6
+  Highest severity : HIGH
+  Top source       : HOST_A (4 windows)
+  Top detection    : Port Scan
+  Recommended filters:
+    1. ip.src == HOST_A && ip.dst == HOST_B
+    2. tcp.flags.syn == 1 && tcp.flags.ack == 0
+════════════════════════════════════════════════════════
+```
+
+---
+
+## Alert Correlation
+
+If the same source IP triggers **3 or more** suspicious windows, the alert is automatically escalated to `HIGH` and a correlation notice is printed:
+
+```
+Correlation: HOST_A has triggered 4 suspicious windows — persistent threat
+```
+
+---
+
+## Baseline Deviation
+
+Each alert shows how far the current window deviates from the learned baseline:
+
+```
+Baseline :
+  - Packet rate: 3.4x above baseline
+  - SYN ratio: 5.1x above baseline
+  - Unique dest ports: 8.7x above baseline
+```
+
+---
+
+## Explain Alert Command
+
+In interactive mode, type `explain alert N` after a suspicious window to get a detailed plain-language breakdown:
+
+```
+question> explain alert 1
+
+=== Alert Explanation ===
+Threat   : Port Scan: 26 destination ports probed
+Severity : MEDIUM
+Window   : 21:04:20-21:04:30
+
+Why this was flagged:
+  - 26 destination ports probed — automated service discovery sweep
+  - Average 1.8 packets/flow — short-lived connections typical of scanning
+  - MITRE ATT&CK: T1046  (https://attack.mitre.org/techniques/T1046)
+
+Deviation from baseline:
+  - Unique dest ports: 8.7x above baseline
+
+Top flow : HOST_A -> HOST_B  [TCP, 120 pkts]
+Filter   : ip.src == HOST_A && ip.dst == HOST_B
+
+Recommended analyst actions:
+  1. Apply filter: ip.src==HOST_A  to review all ports probed by this host
+  2. Verify the source IP is an authorized scanner (Nessus, Nmap, Tenable, etc.)
+  3. Check if any probed ports sent a response — a real response means a live service is exposed
+  ...
+```
+
+---
+
 ## Live Capture Mode
 
 ```
@@ -186,6 +301,7 @@ Questions are only accepted after all warmup stages are ready.
 
 ```
 question> suspicious
+question> explain alert 1
 question> summary
 question> top flows
 question> filter
@@ -222,6 +338,8 @@ question> quit
 | `--max-packets-per-window N` | 50000 | Cap packets kept per window |
 | `--no-interactive` | — | Disable question prompt (for automation) |
 | `--show-window-events` | — | Show per-window logs in interactive mode |
+| `--sanitize` | — | Replace IPs/MACs with HOST_A, HOST_B, ... in all output |
+| `--report PATH` | — | Write a markdown analysis report to PATH after processing |
 
 ---
 
@@ -385,11 +503,14 @@ src/
   app.py          — live capture app + pcap analysis app (rule-based + ML hybrid)
   capture.py      — tshark process wrapper
   config.py       — CLI argument definitions
+  explainer.py    — AlertStore, explain_alert(), analyst next steps per threat type
   features.py     — packet-to-feature conversion
   intelligence.py — question routing and answer formatting
   models.py       — data classes
   parser.py       — tshark CSV line parser
+  report.py       — session summary and markdown report writer
   reporter.py     — SOC alert output, CSV, and SIEM log writer
+  sanitize.py     — IpSanitizer: maps IPs/MACs to HOST_A, HOST_B, ... aliases
   triage.py       — alert triage engine with MITRE ATT&CK mapping
 results/
   live_traffic_windows.csv   — default CSV output per window

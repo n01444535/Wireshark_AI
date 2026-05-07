@@ -41,4 +41,8 @@ def build_parser():
     parser.add_argument("--no-interactive", action="store_true")
     # Show every window while interactive mode is active. / Hiển thị từng window khi chế độ tương tác đang bật.
     parser.add_argument("--show-window-events", action="store_true")
+    # Replace real IPs and MACs in all output with HOST_A, HOST_B, ... aliases.
+    parser.add_argument("--sanitize", action="store_true", help="Anonymize IPs and MACs in output (HOST_A, HOST_B, ...)")
+    # Write a markdown analysis report to the specified path after processing completes.
+    parser.add_argument("--report", default=None, metavar="PATH", help="Write a markdown analysis report to PATH after processing")
     return parser

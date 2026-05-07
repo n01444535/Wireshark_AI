@@ -686,16 +686,20 @@ class TrafficMemory:
 
 # Turns recent traffic memory into terminal answers. / Chuyển bộ nhớ traffic gần đây thành câu trả lời trên terminal.
 class TrafficAnswerEngine:
-    def __init__(self, memory, local_ip=None):
+    def __init__(self, memory, local_ip=None, alert_store=None, sanitizer=None):
         self.memory = memory
         self.local_ip = local_ip
         self.triage_engine = AlertTriageEngine()
+        self._alert_store = alert_store
+        self._sanitizer = sanitizer
 
     def answer(self, question_text):
         # Route natural-ish commands to focused answer methods. / Điều hướng command gần tự nhiên tới hàm trả lời phù hợp.
         original_question_text = question_text.strip()
         normalized_question_text = _normalize_text(original_question_text)
         analyzed_capture_windows = self.memory.snapshot()
+
+        explain_match = re.match(r'^explain\s+alert\s+(\d+)$', normalized_question_text)
 
         if normalized_question_text in {"help", "?", "commands"}:
             answer_body_text = self.help_text()
@@ -705,6 +709,8 @@ class TrafficAnswerEngine:
             answer_body_text = self.answer_triage(analyzed_capture_windows)
         elif self.is_filter_help(normalized_question_text):
             answer_body_text = self.filter_help_text()
+        elif explain_match:
+            answer_body_text = self.answer_explain_alert(int(explain_match.group(1)))
         else:
             # Resolve "from this ip" / "from me" to the detected local IP before routing.
             resolved_original, resolved_normalized = self._resolve_self_reference(
@@ -743,7 +749,21 @@ class TrafficAnswerEngine:
                     + "\n\nTip: type `suspicious`, `filter`, `top flows`, `ip <address>`, `show ...`, or `filter ...`."
                 )
 
+        if self._sanitizer:
+            answer_body_text = self._sanitizer.sanitize_text(answer_body_text)
         return self._with_question(original_question_text, answer_body_text)
+
+    def answer_explain_alert(self, one_based_index: int) -> str:
+        from src.explainer import explain_alert
+        if self._alert_store is None:
+            return "explain alert is not available in this mode."
+        total = self._alert_store.count()
+        if total == 0:
+            return "No suspicious alerts have been recorded yet."
+        alert = self._alert_store.get(one_based_index)
+        if alert is None:
+            return f"Alert {one_based_index} not found. There are {total} alert(s) recorded (1–{total})."
+        return explain_alert(alert, sanitizer=self._sanitizer)
 
     def _resolve_self_reference(self, original_question_text, normalized_question_text):
         # Replace self-reference phrases with the actual local IP so routing works normally.
@@ -772,19 +792,20 @@ class TrafficAnswerEngine:
         local_ip_hint = f"  (your machine IP: {self.local_ip})" if self.local_ip else ""
         return (
             "Commands:\n"
-            "  suspicious          — show anomaly windows\n"
-            "  triage              — full risk assessment (TP vs FP, brute force vs user lockout)\n"
-            "  summary             — latest window stats\n"
-            "  top flows           — highest-risk conversations\n"
-            "  filter              — display filters from recent conversations\n"
-            "  filter help         — natural-language filter examples\n"
-            "  ip <address>        — traffic for a specific IP\n"
+            "  suspicious              — show anomaly windows\n"
+            "  explain alert <N>       — why alert N was flagged + analyst next steps\n"
+            "  triage                  — full risk assessment (TP vs FP, brute force vs user lockout)\n"
+            "  summary                 — latest window stats\n"
+            "  top flows               — highest-risk conversations\n"
+            "  filter                  — display filters from recent conversations\n"
+            "  filter help             — natural-language filter examples\n"
+            "  ip <address>            — traffic for a specific IP\n"
             f"  show traffic from this ip  — outbound from this machine{local_ip_hint}\n"
             "  show traffic to <ip>       — inbound to a specific IP\n"
             "  show <protocol/port/...>   — live matches + Wireshark filter\n"
             "  filter <...>               — build Wireshark filter only\n"
-            "  clear               — clear the screen\n"
-            "  Ctrl+C              — stop capture"
+            "  clear                   — clear the screen\n"
+            "  Ctrl+C                  — stop capture"
         )
 
     def is_filter_help(self, normalized_question_text):

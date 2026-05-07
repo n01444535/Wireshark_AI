@@ -12,21 +12,77 @@ from datetime import datetime
 
 from src.capture import TsharkCapture
 from src.config import build_parser
+from src.explainer import AlertStore
 from src.features import build_window_feature_values, ordered_window_feature_names
 from src.intelligence import (
     TrafficAnswerEngine,
     TrafficMemory,
     TrafficWindow,
     format_inference_statement,
+    ranked_flow_to_filter,
 )
 from src.parser import parse_tshark_csv_line
+from src.report import print_session_summary, write_markdown_report
 from src.reporter import format_empty_window, print_baseline_ready, print_detection, print_warmup, write_row, write_siem_log, SIEM_LOG_PATH
+from src.sanitize import IpSanitizer
 
 
 SYN_FLOOD_SYN_RATIO_THRESHOLD = 0.5
 SYN_FLOOD_MIN_DEST_IPS = 5
 PORT_SCAN_MIN_DST_PORTS = 15
 SUSPICIOUS_SERVICE_PORTS = {22, 3389, 445}
+
+_CORRELATION_ESCALATION_THRESHOLD = 3
+_BASELINE_COMPARISON_KEYS = [
+    ("packets", "Packet rate"),
+    ("syn_ratio", "SYN ratio"),
+    ("unique_dst_ports", "Unique dest ports"),
+    ("unique_dst_ips", "Unique dest IPs"),
+]
+_MIN_BASELINE_MULTIPLE = 2.0
+
+
+def _compute_baseline_means(training_feature_vectors):
+    feature_names = ordered_window_feature_names()
+    n = len(training_feature_vectors)
+    means = {}
+    for i, name in enumerate(feature_names):
+        means[name] = sum(v[i] for v in training_feature_vectors) / n
+    return means
+
+
+def _get_baseline_multiples(window_feature_values, baseline_means):
+    multiples = {}
+    for key, label in _BASELINE_COMPARISON_KEYS:
+        baseline_val = baseline_means.get(key, 0)
+        current_val = window_feature_values.get(key, 0)
+        if baseline_val > 0.001 and current_val >= baseline_val * _MIN_BASELINE_MULTIPLE:
+            multiples[label] = current_val / baseline_val
+    return multiples
+
+
+class _AlertCorrelation:
+    def __init__(self):
+        self._src_counts: collections.Counter = collections.Counter()
+
+    def record(self, src_ips: list) -> None:
+        for ip in src_ips:
+            if ip and ip not in {"", "unknown"}:
+                self._src_counts[ip] += 1
+
+    def get_count(self, src_ips: list) -> int:
+        return max((self._src_counts.get(ip, 0) for ip in src_ips if ip), default=0)
+
+    def should_escalate(self, src_ips: list) -> bool:
+        return self.get_count(src_ips) >= _CORRELATION_ESCALATION_THRESHOLD
+
+    def notice(self, src_ips: list, sanitizer=None) -> str | None:
+        count = self.get_count(src_ips)
+        if count < _CORRELATION_ESCALATION_THRESHOLD:
+            return None
+        top_ip = max(src_ips, key=lambda ip: self._src_counts.get(ip, 0), default="")
+        display_ip = sanitizer.sanitize_ip(top_ip) if (sanitizer and top_ip) else top_ip
+        return f"{display_ip} has triggered {count} suspicious windows — persistent threat"
 
 
 def _rule_based_label(window_feature_values, ranked_flow_summaries=None):
@@ -280,6 +336,8 @@ class LiveTrafficMLApp:
         max_packets_per_window,
         interactive,
         show_window_events,
+        sanitizer=None,
+        report_path=None,
     ):
         # Store runtime configuration from CLI arguments. / Lưu cấu hình runtime từ tham số CLI.
         self.interface = interface
@@ -294,6 +352,8 @@ class LiveTrafficMLApp:
         self.interactive = interactive
         self.interactive_tty = self.interactive and sys.stdin.isatty()
         self.show_window_events = show_window_events
+        self.sanitizer: IpSanitizer | None = sanitizer
+        self.report_path: str | None = report_path
 
         # Queues decouple tshark reading from window processing and user questions. / Queue tách việc đọc tshark khỏi xử lý window và câu hỏi user.
         self.packet_queue = queue.Queue()
@@ -308,7 +368,13 @@ class LiveTrafficMLApp:
         # Memory powers the live question engine. / Bộ nhớ cung cấp dữ liệu cho engine hỏi đáp live.
         self.memory = TrafficMemory()
         self.local_ip = _detect_local_ip()
-        self.answer_engine = TrafficAnswerEngine(self.memory, local_ip=self.local_ip)
+        self._alert_store = AlertStore()
+        self._correlation = _AlertCorrelation()
+        self._baseline_means: dict = {}
+        self.answer_engine = TrafficAnswerEngine(
+            self.memory, local_ip=self.local_ip,
+            alert_store=self._alert_store, sanitizer=self.sanitizer,
+        )
 
         # ML model and warmup vectors define the learned baseline. / Model ML và vector warmup tạo baseline đã học.
         self.scaler, self.model = self.create_model(contamination)
@@ -354,8 +420,9 @@ class LiveTrafficMLApp:
         self.scaler.fit(scaler_data)
         scaled_warmup = self.scaler.transform(self.training_feature_vectors)
         self.model.fit(scaled_warmup)
+        self._baseline_means = _compute_baseline_means(self.training_feature_vectors)
 
-    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity=None):
+    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity=None, ranked_flow_summaries=None):
         write_row(self.output_csv, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary)
         window_entry = {
             "time": datetime.fromtimestamp(window_end).strftime("%H:%M:%S"),
@@ -363,9 +430,11 @@ class LiveTrafficMLApp:
             "score": round(anomaly_score, 4),
             "summary": labeled_inference_summary,
             "features": window_feature_values,
+            "severity": alert_severity,
         }
-        if alert_severity:
-            window_entry["severity"] = alert_severity
+        if ranked_flow_summaries:
+            window_entry["src_ips"] = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+            window_entry["top_filters"] = [ranked_flow_to_filter(f) for f in ranked_flow_summaries[:3]]
         self._session_windows.append(window_entry)
 
     def run(self):
@@ -505,6 +574,9 @@ class LiveTrafficMLApp:
         ]
         labeled_inference_summary = format_inference_statement(raw_inference_summary)
 
+        if self.sanitizer:
+            self.sanitizer.register_flows(ranked_flow_summaries)
+
         # Warmup windows train the baseline. Rule-based attacks are flagged immediately.
         if len(self.training_feature_vectors) < self.warmup_windows:
             self.training_feature_vectors.append(feature_vector)
@@ -519,23 +591,38 @@ class LiveTrafficMLApp:
                 raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
                 labeled_inference_summary = format_inference_statement(raw_inference_summary)
                 early_severity = _classify_alert_severity(early_label, raw_inference_summary)
+                src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+                self._correlation.record(src_ips)
+                corr_notice = self._correlation.notice(src_ips, self.sanitizer)
+                if self._correlation.should_escalate(src_ips):
+                    early_severity = "HIGH"
                 if self.should_print_window_events():
                     print_detection(
-                        window_end,
-                        window_feature_values,
-                        ranked_flow_summaries,
-                        "suspicious",
-                        labeled_inference_summary,
+                        window_end, window_feature_values, ranked_flow_summaries,
+                        "suspicious", labeled_inference_summary,
                         display_top_flows=self.display_top_flows,
                         alert_severity=early_severity,
+                        sanitizer=self.sanitizer,
+                        correlation_notice=corr_notice,
                     )
                 from src.triage import get_mitre_id
+                mitre_id = get_mitre_id(raw_inference_summary)
                 write_siem_log(
                     SIEM_LOG_PATH, window_start, window_end,
                     raw_inference_summary, early_severity or "LOW",
-                    get_mitre_id(raw_inference_summary),
-                    ranked_flow_summaries, window_feature_values.get("packets", 0),
+                    mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
                 )
+                self._alert_store.add({
+                    "threat": raw_inference_summary,
+                    "severity": early_severity or "LOW",
+                    "mitre_id": mitre_id,
+                    "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                    "features": window_feature_values,
+                    "flows": ranked_flow_summaries,
+                    "baseline_multiples": {},
+                    "src_ips": src_ips,
+                    "correlation_count": self._correlation.get_count(src_ips),
+                })
             else:
                 if self.should_print_window_events():
                     print_warmup(window_end, window_feature_values, remaining_warmup_window_count)
@@ -543,7 +630,7 @@ class LiveTrafficMLApp:
                     if self.should_print_window_events():
                         print_baseline_ready(window_end)
 
-            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity)
+            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity, ranked_flow_summaries)
             self.memory.add_window(
                 TrafficWindow(
                     window_start=window_start,
@@ -576,25 +663,44 @@ class LiveTrafficMLApp:
             raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
         labeled_inference_summary = format_inference_statement(raw_inference_summary)
         alert_severity = _classify_alert_severity(window_label, raw_inference_summary)
+        baseline_multiples = _get_baseline_multiples(window_feature_values, self._baseline_means) if self._baseline_means else {}
+        src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+        corr_notice = None
+        if window_label == "suspicious":
+            self._correlation.record(src_ips)
+            corr_notice = self._correlation.notice(src_ips, self.sanitizer)
+            if self._correlation.should_escalate(src_ips):
+                alert_severity = "HIGH"
         if self.should_print_window_events():
             print_detection(
-                window_end,
-                window_feature_values,
-                ranked_flow_summaries,
-                window_label,
-                labeled_inference_summary,
+                window_end, window_feature_values, ranked_flow_summaries,
+                window_label, labeled_inference_summary,
                 display_top_flows=self.display_top_flows,
                 alert_severity=alert_severity,
+                sanitizer=self.sanitizer,
+                baseline_multiples=baseline_multiples if window_label == "suspicious" else None,
+                correlation_notice=corr_notice,
             )
         if window_label == "suspicious":
             from src.triage import get_mitre_id
+            mitre_id = get_mitre_id(raw_inference_summary)
             write_siem_log(
                 SIEM_LOG_PATH, window_start, window_end,
                 raw_inference_summary, alert_severity or "LOW",
-                get_mitre_id(raw_inference_summary),
-                ranked_flow_summaries, window_feature_values.get("packets", 0),
+                mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
             )
-        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity)
+            self._alert_store.add({
+                "threat": raw_inference_summary,
+                "severity": alert_severity or "LOW",
+                "mitre_id": mitre_id,
+                "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                "features": window_feature_values,
+                "flows": ranked_flow_summaries,
+                "baseline_multiples": baseline_multiples,
+                "src_ips": src_ips,
+                "correlation_count": self._correlation.get_count(src_ips),
+            })
+        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity, ranked_flow_summaries)
         self.memory.add_window(
             TrafficWindow(
                 window_start=window_start,
@@ -612,6 +718,12 @@ class LiveTrafficMLApp:
         self.stop_event.set()
         self.capture.shutdown()
         _save_to_history(self._history_filename, self._session_windows, self._session_source)
+        print_session_summary(self._session_windows, sanitizer=self.sanitizer)
+        if self.report_path:
+            write_markdown_report(
+                self.report_path, self._session_source,
+                self._session_windows, self._alert_store, sanitizer=self.sanitizer,
+            )
 
 
 # Offline analysis of a .pcap file: reads all packets, slices by timestamp, then enters Q&A.
@@ -628,6 +740,8 @@ class PcapTrafficMLApp:
         display_filter,
         max_packets_per_window,
         interactive,
+        sanitizer=None,
+        report_path=None,
     ):
         self.pcap_file = pcap_file
         self.window_seconds = window_seconds
@@ -640,12 +754,20 @@ class PcapTrafficMLApp:
         self.max_packets_per_window = max_packets_per_window
         self.interactive = interactive
         self.interactive_tty = self.interactive and sys.stdin.isatty()
+        self.sanitizer: IpSanitizer | None = sanitizer
+        self.report_path: str | None = report_path
 
         self._history_filename = datetime.now().strftime("%d_%m_%Y_%H_%M_%S") + ".json"
         self._session_windows = []
         self._session_source = os.path.basename(pcap_file)
         self.memory = TrafficMemory()
-        self.answer_engine = TrafficAnswerEngine(self.memory, local_ip=None)
+        self._alert_store = AlertStore()
+        self._correlation = _AlertCorrelation()
+        self._baseline_means: dict = {}
+        self.answer_engine = TrafficAnswerEngine(
+            self.memory, local_ip=None,
+            alert_store=self._alert_store, sanitizer=self.sanitizer,
+        )
         self.scaler, self.model = self._create_model(contamination)
         self.training_feature_vectors = []
         self._historical_vectors = load_history_vectors()
@@ -670,6 +792,7 @@ class PcapTrafficMLApp:
         self.scaler.fit(scaler_data)
         scaled_warmup = self.scaler.transform(self.training_feature_vectors)
         self.model.fit(scaled_warmup)
+        self._baseline_means = _compute_baseline_means(self.training_feature_vectors)
 
     def run(self):
         if not os.path.isfile(self.pcap_file):
@@ -740,6 +863,12 @@ class PcapTrafficMLApp:
                 print(f"    Suspicious   : {suspicious_count}")
             print(f"  CSV output     : {self.output_csv}")
             _save_to_history(self._history_filename, self._session_windows, self._session_source)
+            print_session_summary(self._session_windows, sanitizer=self.sanitizer)
+            if self.report_path:
+                write_markdown_report(
+                    self.report_path, self._session_source,
+                    self._session_windows, self._alert_store, sanitizer=self.sanitizer,
+                )
 
         if not interrupted and self.interactive_tty:
             self._interactive_loop()
@@ -835,7 +964,7 @@ class PcapTrafficMLApp:
             result.append((pkts, window_start, window_end))
         return result
 
-    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity=None):
+    def _record_window(self, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity=None, ranked_flow_summaries=None):
         write_row(self.output_csv, window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary)
         window_entry = {
             "time": datetime.fromtimestamp(window_end).strftime("%H:%M:%S"),
@@ -843,9 +972,11 @@ class PcapTrafficMLApp:
             "score": round(anomaly_score, 4),
             "summary": labeled_inference_summary,
             "features": window_feature_values,
+            "severity": alert_severity,
         }
-        if alert_severity:
-            window_entry["severity"] = alert_severity
+        if ranked_flow_summaries:
+            window_entry["src_ips"] = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+            window_entry["top_filters"] = [ranked_flow_to_filter(f) for f in ranked_flow_summaries[:3]]
         self._session_windows.append(window_entry)
 
     def _process_window(self, packet_records, window_start, window_end):
@@ -860,6 +991,9 @@ class PcapTrafficMLApp:
         ]
         labeled_inference_summary = format_inference_statement(raw_inference_summary)
 
+        if self.sanitizer:
+            self.sanitizer.register_flows(ranked_flow_summaries)
+
         if len(self.training_feature_vectors) < self.warmup_windows:
             self.training_feature_vectors.append(feature_vector)
             if len(self.training_feature_vectors) == self.warmup_windows:
@@ -872,23 +1006,38 @@ class PcapTrafficMLApp:
                 raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
                 labeled_inference_summary = format_inference_statement(raw_inference_summary)
                 early_severity = _classify_alert_severity(early_label, raw_inference_summary)
+                src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+                self._correlation.record(src_ips)
+                corr_notice = self._correlation.notice(src_ips, self.sanitizer)
+                if self._correlation.should_escalate(src_ips):
+                    early_severity = "HIGH"
                 print_detection(
-                    window_end,
-                    window_feature_values,
-                    ranked_flow_summaries,
-                    early_label,
-                    labeled_inference_summary,
+                    window_end, window_feature_values, ranked_flow_summaries,
+                    early_label, labeled_inference_summary,
                     display_top_flows=self.display_top_flows,
                     alert_severity=early_severity,
+                    sanitizer=self.sanitizer,
+                    correlation_notice=corr_notice,
                 )
                 from src.triage import get_mitre_id
+                mitre_id = get_mitre_id(raw_inference_summary)
                 write_siem_log(
                     SIEM_LOG_PATH, window_start, window_end,
                     raw_inference_summary, early_severity or "LOW",
-                    get_mitre_id(raw_inference_summary),
-                    ranked_flow_summaries, window_feature_values.get("packets", 0),
+                    mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
                 )
-            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity)
+                self._alert_store.add({
+                    "threat": raw_inference_summary,
+                    "severity": early_severity or "LOW",
+                    "mitre_id": mitre_id,
+                    "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                    "features": window_feature_values,
+                    "flows": ranked_flow_summaries,
+                    "baseline_multiples": {},
+                    "src_ips": src_ips,
+                    "correlation_count": self._correlation.get_count(src_ips),
+                })
+            self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity, ranked_flow_summaries)
             self.memory.add_window(TrafficWindow(
                 window_start=window_start, window_end=window_end,
                 window_feature_values=window_feature_values,
@@ -909,24 +1058,42 @@ class PcapTrafficMLApp:
             raw_inference_summary = _derive_suspicious_reason(window_feature_values, ranked_flow_summaries)
         labeled_inference_summary = format_inference_statement(raw_inference_summary)
         alert_severity = _classify_alert_severity(window_label, raw_inference_summary)
+        baseline_multiples = _get_baseline_multiples(window_feature_values, self._baseline_means) if self._baseline_means else {}
+        src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+        corr_notice = None
         if window_label == "suspicious":
+            self._correlation.record(src_ips)
+            corr_notice = self._correlation.notice(src_ips, self.sanitizer)
+            if self._correlation.should_escalate(src_ips):
+                alert_severity = "HIGH"
             print_detection(
-                window_end,
-                window_feature_values,
-                ranked_flow_summaries,
-                window_label,
-                labeled_inference_summary,
+                window_end, window_feature_values, ranked_flow_summaries,
+                window_label, labeled_inference_summary,
                 display_top_flows=self.display_top_flows,
                 alert_severity=alert_severity,
+                sanitizer=self.sanitizer,
+                baseline_multiples=baseline_multiples,
+                correlation_notice=corr_notice,
             )
             from src.triage import get_mitre_id
+            mitre_id = get_mitre_id(raw_inference_summary)
             write_siem_log(
                 SIEM_LOG_PATH, window_start, window_end,
                 raw_inference_summary, alert_severity or "LOW",
-                get_mitre_id(raw_inference_summary),
-                ranked_flow_summaries, window_feature_values.get("packets", 0),
+                mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
             )
-        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity)
+            self._alert_store.add({
+                "threat": raw_inference_summary,
+                "severity": alert_severity or "LOW",
+                "mitre_id": mitre_id,
+                "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                "features": window_feature_values,
+                "flows": ranked_flow_summaries,
+                "baseline_multiples": baseline_multiples,
+                "src_ips": src_ips,
+                "correlation_count": self._correlation.get_count(src_ips),
+            })
+        self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity, ranked_flow_summaries)
         self.memory.add_window(TrafficWindow(
             window_start=window_start, window_end=window_end,
             window_feature_values=window_feature_values,
@@ -967,6 +1134,9 @@ class PcapTrafficMLApp:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    sanitizer = IpSanitizer() if args.sanitize else None
+    if args.sanitize:
+        print("[Sanitize mode] IPs and MACs will be replaced with HOST_A, HOST_B, ... in all output.")
     if args.pcap:
         app = PcapTrafficMLApp(
             pcap_file=args.pcap,
@@ -979,6 +1149,8 @@ def main():
             display_filter=args.filter,
             max_packets_per_window=args.max_packets_per_window,
             interactive=not args.no_interactive,
+            sanitizer=sanitizer,
+            report_path=args.report,
         )
     else:
         app = LiveTrafficMLApp(
@@ -993,5 +1165,7 @@ def main():
             max_packets_per_window=args.max_packets_per_window,
             interactive=not args.no_interactive,
             show_window_events=args.show_window_events,
+            sanitizer=sanitizer,
+            report_path=args.report,
         )
     app.run()

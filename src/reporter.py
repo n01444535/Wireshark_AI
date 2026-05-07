@@ -121,6 +121,9 @@ def print_detection(
     inference_summary,
     display_top_flows=5,
     alert_severity=None,
+    sanitizer=None,
+    baseline_multiples=None,
+    correlation_notice=None,
 ):
     from src.triage import get_mitre_id
 
@@ -135,8 +138,11 @@ def print_detection(
     mitre_id = get_mitre_id(threat_text)
     mitre_tag = f"  [{mitre_id}]" if mitre_id else ""
 
-    src_ips = list({f.source_ip for f in ranked_flow_summaries if f.source_ip not in {"unknown", ""}})[:3]
-    src_display = ", ".join(src_ips) if src_ips else "unknown"
+    raw_src_ips = list({f.source_ip for f in ranked_flow_summaries if f.source_ip not in {"unknown", ""}})[:3]
+    if sanitizer:
+        src_display = ", ".join(sanitizer.sanitize_ip(ip) for ip in raw_src_ips) if raw_src_ips else "unknown"
+    else:
+        src_display = ", ".join(raw_src_ips) if raw_src_ips else "unknown"
 
     evidence_lines = _build_alert_evidence(window_feature_values)
     ts = datetime.fromtimestamp(window_end).strftime("%Y-%m-%d %H:%M:%S")
@@ -144,20 +150,32 @@ def print_detection(
     print(f"\n{_SOC_SEPARATOR}")
     print(f"[{ts}] ALERT — {severity}")
     print(_SOC_THIN_SEP)
+    if sanitizer:
+        threat_text = sanitizer.sanitize_text(threat_text)
     print(f"Threat   : {threat_text}{mitre_tag}")
     print(f"Source   : {src_display}")
     print(f"Severity : {severity}")
+    if correlation_notice:
+        print(f"Correlation: {correlation_notice}")
     if evidence_lines:
         print("Evidence :")
         for line in evidence_lines:
             print(f"  - {line}")
+    if baseline_multiples:
+        print("Baseline :")
+        for label, multiple in baseline_multiples.items():
+            print(f"  - {label}: {multiple:.1f}x above baseline")
 
     top_flows = ranked_flow_summaries[:display_top_flows]
     if top_flows:
         print("\nTop Flows:")
         for i, flow in enumerate(top_flows, 1):
-            print(f"  {i}. {flow.source_ip} → {flow.destination_ip}  [{flow.protocol_name}, {flow.packet_count} pkts]")
-            print(f"     Filter: {ranked_flow_to_filter(flow)}")
+            src = sanitizer.sanitize_ip(flow.source_ip) if sanitizer else flow.source_ip
+            dst = sanitizer.sanitize_ip(flow.destination_ip) if sanitizer else flow.destination_ip
+            raw_filter = ranked_flow_to_filter(flow)
+            display_filter = sanitizer.sanitize_text(raw_filter) if sanitizer else raw_filter
+            print(f"  {i}. {src} → {dst}  [{flow.protocol_name}, {flow.packet_count} pkts]")
+            print(f"     Filter: {display_filter}")
     print(_SOC_SEPARATOR)
 
 
