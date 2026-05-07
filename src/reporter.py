@@ -124,6 +124,10 @@ def print_detection(
     sanitizer=None,
     baseline_multiples=None,
     correlation_notice=None,
+    confidence=None,
+    fp_risk=None,
+    suppression_notice=None,
+    asset_context=None,
 ):
     from src.triage import get_mitre_id
 
@@ -147,6 +151,8 @@ def print_detection(
     evidence_lines = _build_alert_evidence(window_feature_values)
     ts = datetime.fromtimestamp(window_end).strftime("%Y-%m-%d %H:%M:%S")
 
+    if suppression_notice:
+        print(f"\n[i] {suppression_notice}")
     print(f"\n{_SOC_SEPARATOR}")
     print(f"[{ts}] ALERT — {severity}")
     print(_SOC_THIN_SEP)
@@ -155,6 +161,11 @@ def print_detection(
     print(f"Threat   : {threat_text}{mitre_tag}")
     print(f"Source   : {src_display}")
     print(f"Severity : {severity}")
+    if confidence is not None:
+        fp_display = f"  |  FP Risk: {fp_risk}" if fp_risk else ""
+        print(f"Confidence: {confidence}%{fp_display}")
+    if asset_context:
+        print(f"Asset    : {asset_context}")
     if correlation_notice:
         print(f"Correlation: {correlation_notice}")
     if evidence_lines:

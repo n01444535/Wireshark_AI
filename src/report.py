@@ -26,7 +26,7 @@ def _detection_label(summary: str) -> str:
 
 
 # Print an end-of-session SOC summary block to the terminal. / In khối tóm tắt SOC cuối phiên ra terminal.
-def print_session_summary(session_windows: list, sanitizer=None) -> None:
+def print_session_summary(session_windows: list, sanitizer=None, kill_chain_tracker=None) -> None:
     total = len(session_windows)
     if total == 0:
         return
@@ -82,16 +82,26 @@ def print_session_summary(session_windows: list, sanitizer=None) -> None:
         print("  Recommended filters:")
         for i, f in enumerate(top_filters, 1):
             print(f"    {i}. {f}")
+
+    if kill_chain_tracker:
+        notable_chains = kill_chain_tracker.get_notable_chains(min_events=2, sanitizer=sanitizer)
+        if notable_chains:
+            print(_SOC_THIN_SEP)
+            print("Kill Chain Activity:")
+            for chain in notable_chains:
+                for line in chain.splitlines():
+                    print(f"  {line}")
     print(_SOC_SEPARATOR)
 
 
-# Generate and write a structured markdown analysis report to disk, with exec summary, per-alert sections, and optional IP mapping table. / Tạo và ghi báo cáo markdown có cấu trúc ra đĩa, gồm tóm tắt, chi tiết alert, và bảng ánh xạ IP tuỳ chọn.
+# Generate and write a structured markdown analysis report to disk, with exec summary, per-alert sections, kill chain, and optional IP mapping table. / Tạo và ghi báo cáo markdown có cấu trúc ra đĩa, gồm tóm tắt, chi tiết alert, kill chain, và bảng ánh xạ IP tuỳ chọn.
 def write_markdown_report(
     report_path: str,
     session_source: str,
     session_windows: list,
     alert_store,
     sanitizer=None,
+    kill_chain_tracker=None,
 ) -> None:
     os.makedirs(os.path.dirname(report_path) if os.path.dirname(report_path) else ".", exist_ok=True)
 
@@ -146,6 +156,9 @@ def write_markdown_report(
         "",
     ]
 
+    from src.explainer import _get_next_steps
+    from src.confidence import get_benign_causes
+
     alerts = alert_store.all() if alert_store else []
     if not alerts:
         lines.append("*No suspicious alerts recorded.*")
@@ -153,43 +166,55 @@ def write_markdown_report(
         for idx, alert in enumerate(alerts, 1):
             threat = alert.get("threat", "Unknown")
             severity = alert.get("severity", "LOW")
+            confidence = alert.get("confidence")
+            fp_risk = alert.get("fp_risk")
             mitre_id = alert.get("mitre_id", "") or get_mitre_id(threat)
             window_time = alert.get("window_time", "")
             features = alert.get("features", {})
             flows = alert.get("flows", [])
             baseline_multiples = alert.get("baseline_multiples", {})
             correlation_count = alert.get("correlation_count", 0)
+            is_allowlisted = alert.get("is_allowlisted", False)
 
+            conf_str = f" | Confidence: {confidence}% | FP Risk: {fp_risk}" if confidence is not None else ""
             mitre_tag = f" [{mitre_id}]" if mitre_id else ""
-            lines.append(f"### Alert {idx} — [{severity}] {threat}{mitre_tag}")
+            lines.append(f"### Alert {idx} — [{severity}]{conf_str} {threat}{mitre_tag}")
             lines.append("")
             if window_time:
                 lines.append(f"**Time:** {window_time}  ")
             if correlation_count >= 3:
                 lines.append(f"**Correlation:** Source triggered {correlation_count} suspicious windows  ")
+            if is_allowlisted:
+                lines.append("**Note:** Source is on the authorized-scanner allowlist — verify before escalating  ")
             lines.append("")
 
-            lines.append("**Evidence:**")
-            syn_ratio = features.get("syn_ratio", 0)
-            if syn_ratio > 0.1:
-                mult = baseline_multiples.get("SYN ratio", 0)
-                suffix = f" ({mult:.1f}x above baseline)" if mult else ""
-                lines.append(f"- SYN ratio: {syn_ratio:.2f}{suffix}")
-            unique_dsts = int(features.get("unique_dst_ips", 0))
-            if unique_dsts > 1:
-                mult = baseline_multiples.get("Unique dest IPs", 0)
-                suffix = f" ({mult:.1f}x above baseline)" if mult else ""
-                lines.append(f"- Unique destination IPs: {unique_dsts}{suffix}")
-            unique_ports = int(features.get("unique_dst_ports", 0))
-            if unique_ports > 3:
-                mult = baseline_multiples.get("Unique dest ports", 0)
-                suffix = f" ({mult:.1f}x above baseline)" if mult else ""
-                lines.append(f"- Destination ports: {unique_ports}{suffix}")
-            packets = int(features.get("packets", 0))
-            mult = baseline_multiples.get("Packet rate", 0)
-            suffix = f" ({mult:.1f}x above baseline)" if mult else ""
-            lines.append(f"- Packets: {packets}{suffix}")
-            lines.append("")
+            # Evidence table — gives an "explainable AI" view of what drove the alert
+            _EVIDENCE_SIGNALS = [
+                ("unique_dst_ports", "Unique dest ports", "Unique dest ports"),
+                ("syn_ratio",        "SYN ratio",         "SYN ratio"),
+                ("unique_dst_ips",   "Unique dest IPs",   "Unique dest IPs"),
+                ("mean_packets_per_flow", "Avg pkts/flow", None),
+                ("packets",          "Packet rate",       "Packet rate"),
+                ("arp_max_ips_per_mac", "Max IPs per MAC", None),
+            ]
+            table_rows = []
+            for feat_key, label, baseline_key in _EVIDENCE_SIGNALS:
+                val = features.get(feat_key, 0)
+                if val == 0:
+                    continue
+                val_str = f"{val:.2f}" if isinstance(val, float) and val < 10 else str(int(val)) if isinstance(val, float) else str(val)
+                mult = baseline_multiples.get(baseline_key, 0) if baseline_key else 0
+                baseline_str = f"{mult:.1f}x" if mult else "—"
+                table_rows.append((label, val_str, baseline_str))
+
+            if table_rows:
+                lines.append("**Evidence Table:**")
+                lines.append("")
+                lines.append("| Signal | Value | Baseline |")
+                lines.append("|--------|-------|----------|")
+                for row_label, row_val, row_base in table_rows:
+                    lines.append(f"| {row_label} | {row_val} | {row_base} |")
+                lines.append("")
 
             if flows:
                 top_flow = flows[0]
@@ -206,7 +231,12 @@ def write_markdown_report(
                 lines.append(f"**MITRE ATT&CK:** [{mitre_id}]({mitre_url})")
                 lines.append("")
 
-            from src.explainer import _get_next_steps
+            benign = get_benign_causes(threat)
+            lines.append("**Possible Benign Causes:**")
+            for cause in benign:
+                lines.append(f"- {cause}")
+            lines.append("")
+
             steps = _get_next_steps(threat)
             lines.append("**Recommended Actions:**")
             for i, step in enumerate(steps, 1):
@@ -218,6 +248,19 @@ def write_markdown_report(
                     step_text = step_text.replace("<src>", src_ip)
                 lines.append(f"{i}. {step_text}")
             lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    # Kill chain section if notable multi-event sources were observed
+    if kill_chain_tracker:
+        notable_chains = kill_chain_tracker.get_notable_chains(min_events=2, sanitizer=sanitizer)
+        if notable_chains:
+            lines += ["## Kill Chain Activity", ""]
+            for chain_text in notable_chains:
+                lines.append("```")
+                lines.append(chain_text)
+                lines.append("```")
+                lines.append("")
             lines.append("---")
             lines.append("")
 

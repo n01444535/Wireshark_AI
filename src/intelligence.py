@@ -699,7 +699,8 @@ class TrafficAnswerEngine:
         normalized_question_text = _normalize_text(original_question_text)
         analyzed_capture_windows = self.memory.snapshot()
 
-        explain_match = re.match(r'^explain\s+alert\s+(\d+)$', normalized_question_text)
+        explain_match = re.match(r'^(?:explain|next\s+steps?)\s+alert\s+(\d+)$', normalized_question_text)
+        priority_cmd = normalized_question_text in {"priority", "prioritize", "queue", "alert queue", "priority queue"}
 
         if normalized_question_text in {"help", "?", "commands"}:
             answer_body_text = self.help_text()
@@ -709,6 +710,8 @@ class TrafficAnswerEngine:
             answer_body_text = self.answer_triage(analyzed_capture_windows)
         elif self.is_filter_help(normalized_question_text):
             answer_body_text = self.filter_help_text()
+        elif priority_cmd:
+            answer_body_text = self.answer_priority()
         elif explain_match:
             answer_body_text = self.answer_explain_alert(int(explain_match.group(1)))
         else:
@@ -765,6 +768,32 @@ class TrafficAnswerEngine:
             return f"Alert {one_based_index} not found. There are {total} alert(s) recorded (1–{total})."
         return explain_alert(alert, sanitizer=self._sanitizer)
 
+    # Return a ranked list of all alerts sorted by confidence then severity — the triage priority queue. / Trả danh sách alert sắp xếp theo confidence và severity — hàng đợi triage ưu tiên.
+    def answer_priority(self) -> str:
+        if self._alert_store is None:
+            return "Alert store is not available in this mode."
+        alerts = self._alert_store.all()
+        if not alerts:
+            return "No suspicious alerts have been recorded yet."
+        severity_weight = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+        sorted_pairs = sorted(
+            enumerate(alerts, 1),
+            key=lambda x: (x[1].get("confidence", 0), severity_weight.get(x[1].get("severity", "LOW"), 1)),
+            reverse=True,
+        )
+        lines = [f"Alert Priority Queue ({len(alerts)} alert(s)):"]
+        for idx, alert in sorted_pairs[:10]:
+            severity = alert.get("severity", "LOW")
+            confidence = alert.get("confidence")
+            fp_risk = alert.get("fp_risk", "")
+            threat = alert.get("threat", "Unknown")[:55]
+            window_time = alert.get("window_time", "")
+            conf_str = f" | {confidence}% conf | FP: {fp_risk}" if confidence is not None else ""
+            lines.append(f"  {idx:2}. [{severity}{conf_str}] {threat}")
+            if window_time:
+                lines.append(f"       Window: {window_time}  →  type: explain alert {idx}")
+        return "\n".join(lines)
+
     def _resolve_self_reference(self, original_question_text, normalized_question_text):
         # Replace self-reference phrases with the actual local IP so routing works normally.
         if not self.local_ip or not _is_self_reference(normalized_question_text):
@@ -793,7 +822,9 @@ class TrafficAnswerEngine:
         return (
             "Commands:\n"
             "  suspicious              — show anomaly windows\n"
-            "  explain alert <N>       — why alert N was flagged + analyst next steps\n"
+            "  explain alert <N>       — why alert N was flagged, confidence, benign causes, triage checklist\n"
+            "  next steps alert <N>    — alias for explain alert <N>\n"
+            "  priority                — ranked alert priority queue (by confidence + severity)\n"
             "  triage                  — full risk assessment (TP vs FP, brute force vs user lockout)\n"
             "  summary                 — latest window stats\n"
             "  top flows               — highest-risk conversations\n"

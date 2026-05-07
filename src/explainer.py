@@ -157,9 +157,10 @@ class AlertStore:
             return list(self._alerts)
 
 
-# Format a full human-readable explanation for a stored alert, including MITRE link and analyst next steps. / Định dạng giải thích đầy đủ cho alert, bao gồm link MITRE và hành động phân tích khuyến nghị.
+# Format a full human-readable explanation for a stored alert, including confidence, benign causes, triage checklist, and analyst next steps. / Định dạng giải thích đầy đủ cho alert, bao gồm confidence, nguyên nhân lành tính, checklist triage, và hành động khuyến nghị.
 def explain_alert(alert: dict, sanitizer=None) -> str:
     from src.intelligence import ranked_flow_to_filter
+    from src.confidence import get_benign_causes, build_triage_checklist
 
     threat = alert.get("threat", "Unknown")
     severity = alert.get("severity", "LOW")
@@ -169,14 +170,24 @@ def explain_alert(alert: dict, sanitizer=None) -> str:
     flows = alert.get("flows", [])
     baseline_multiples = alert.get("baseline_multiples", {})
     correlation_count = alert.get("correlation_count", 0)
+    confidence = alert.get("confidence")
+    fp_risk = alert.get("fp_risk")
+    stored_checklist = alert.get("triage_checklist")
+    flow_direction = alert.get("flow_direction", "unknown")
+    is_allowlisted = alert.get("is_allowlisted", False)
+    src_ips = alert.get("src_ips", [])
+    dst_ips = [f.destination_ip for f in flows if f.destination_ip not in {"", "unknown"}] if flows else []
+    chain_timeline = alert.get("chain_timeline")
 
     lines = ["=== Alert Explanation ==="]
     lines.append(f"Threat   : {threat}")
     lines.append(f"Severity : {severity}")
+    if confidence is not None:
+        lines.append(f"Confidence: {confidence}%  |  FP Risk: {fp_risk or 'N/A'}")
     if window_time:
         lines.append(f"Window   : {window_time}")
     if correlation_count >= 3:
-        lines.append(f"Correlation: this source has triggered {correlation_count} suspicious windows")
+        lines.append(f"Correlation: this source triggered {correlation_count} suspicious windows — persistent threat")
 
     lines.append("")
     lines.append("Why this was flagged:")
@@ -201,6 +212,27 @@ def explain_alert(alert: dict, sanitizer=None) -> str:
         lines.append("")
         lines.append(f"Top flow : {src} -> {dst}  [{top_flow.protocol_name}, {top_flow.packet_count} pkts]")
         lines.append(f"Filter   : {display_filter}")
+
+    # Benign causes reduce panic for analysts reviewing the alert
+    benign = get_benign_causes(threat)
+    lines.append("")
+    lines.append("Possible benign causes:")
+    for cause in benign:
+        lines.append(f"  - {cause}")
+
+    lines.append("")
+    lines.append("Triage checklist:")
+    if stored_checklist:
+        lines.extend(stored_checklist)
+    else:
+        checklist = build_triage_checklist(src_ips, dst_ips, features, is_allowlisted, correlation_count, flow_direction)
+        lines.extend(checklist)
+
+    if chain_timeline:
+        lines.append("")
+        lines.append("Kill chain timeline:")
+        for chain_line in chain_timeline:
+            lines.append(f"  {chain_line}")
 
     lines.append("")
     lines.append("Recommended analyst actions:")

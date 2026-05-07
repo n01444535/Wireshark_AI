@@ -1,0 +1,30 @@
+# Known network assets. Matching IPs receive role and criticality context in alerts.
+#
+# criticality: critical | high | medium | low
+# role: domain_controller | database | file_server | web_server |
+#        ics_hmi | plc | scada | router | firewall |
+#        employee_laptop | printer | unknown
+#
+# Example:
+# assets:
+#   - ip: 192.168.0.1
+#     name: Gateway
+#     role: router
+#     criticality: high
+#
+#   - ip: 192.168.0.10
+#     name: DC01
+#     role: domain_controller
+#     criticality: critical
+#
+#   - ip: 192.168.0.20
+#     name: HMI-01
+#     role: ics_hmi
+#     criticality: critical
+#
+#   - ip: 192.168.0.50
+#     name: FileServer
+#     role: file_server
+#     criticality: high
+
+assets: []

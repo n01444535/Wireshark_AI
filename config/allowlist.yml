@@ -1,0 +1,34 @@
+# Hosts authorized to perform network scanning.
+# Their alerts are downgraded in severity — not suppressed from SIEM log.
+# Use real IP addresses. Example: 192.168.0.100
+authorized_scanners: []
+
+# Ports treated as expected business traffic.
+# Reduces false-positive risk when these are the only ports involved.
+trusted_ports:
+  - port: 53
+    name: DNS
+  - port: 80
+    name: HTTP
+  - port: 443
+    name: HTTPS
+  - port: 123
+    name: NTP
+  - port: 67
+    name: DHCP-Server
+  - port: 68
+    name: DHCP-Client
+  - port: 5353
+    name: mDNS
+  - port: 1900
+    name: SSDP
+
+# Protocol names that generate high-volume benign traffic.
+# When the primary source of an alert is one of these, FP risk is raised.
+noisy_protocols:
+  - mdns
+  - ssdp
+  - dhcp
+  - nbns
+  - llmnr
+  - igmp

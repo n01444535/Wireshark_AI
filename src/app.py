@@ -10,8 +10,10 @@ import threading
 import time
 from datetime import datetime
 
+from src.allowlist import AllowlistContext
 from src.capture import TsharkCapture
 from src.config import build_parser
+from src.confidence import build_triage_checklist, classify_flow_direction, compute_confidence, get_benign_causes
 from src.explainer import AlertStore
 from src.features import build_window_feature_values, ordered_window_feature_names
 from src.intelligence import (
@@ -21,10 +23,12 @@ from src.intelligence import (
     format_inference_statement,
     ranked_flow_to_filter,
 )
+from src.killchain import KillChainTracker
 from src.parser import parse_tshark_csv_line
 from src.report import print_session_summary, write_markdown_report
 from src.reporter import format_empty_window, print_baseline_ready, print_detection, print_warmup, write_row, write_siem_log, SIEM_LOG_PATH
 from src.sanitize import IpSanitizer
+from src.suppression import AlertSuppressor
 
 
 SYN_FLOOD_SYN_RATIO_THRESHOLD = 0.5
@@ -338,6 +342,7 @@ class LiveTrafficMLApp:
         show_window_events,
         sanitizer=None,
         report_path=None,
+        allowlist_ctx=None,
     ):
         # Store runtime configuration from CLI arguments. / Lưu cấu hình runtime từ tham số CLI.
         self.interface = interface
@@ -354,6 +359,7 @@ class LiveTrafficMLApp:
         self.show_window_events = show_window_events
         self.sanitizer: IpSanitizer | None = sanitizer
         self.report_path: str | None = report_path
+        self._allowlist_ctx: AllowlistContext = allowlist_ctx or AllowlistContext()
 
         # Queues decouple tshark reading from window processing and user questions. / Queue tách việc đọc tshark khỏi xử lý window và câu hỏi user.
         self.packet_queue = queue.Queue()
@@ -371,6 +377,8 @@ class LiveTrafficMLApp:
         self._alert_store = AlertStore()
         self._correlation = _AlertCorrelation()
         self._baseline_means: dict = {}
+        self._suppressor = AlertSuppressor()
+        self._kill_chain = KillChainTracker()
         self.answer_engine = TrafficAnswerEngine(
             self.memory, local_ip=self.local_ip,
             alert_store=self._alert_store, sanitizer=self.sanitizer,
@@ -592,11 +600,30 @@ class LiveTrafficMLApp:
                 labeled_inference_summary = format_inference_statement(raw_inference_summary)
                 early_severity = _classify_alert_severity(early_label, raw_inference_summary)
                 src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+                dst_ips = list({f.destination_ip for f in ranked_flow_summaries if f.destination_ip not in {"", "unknown"}})
                 self._correlation.record(src_ips)
                 corr_notice = self._correlation.notice(src_ips, self.sanitizer)
                 if self._correlation.should_escalate(src_ips):
                     early_severity = "HIGH"
-                if self.should_print_window_events():
+                flow_direction = classify_flow_direction(src_ips, dst_ips)
+                is_allowlisted = self._allowlist_ctx.any_authorized(src_ips)
+                touches_critical = self._allowlist_ctx.touches_critical_asset(dst_ips)
+                confidence, fp_risk = compute_confidence(
+                    raw_inference_summary, window_feature_values, {},
+                    self._correlation.get_count(src_ips), is_allowlisted, touches_critical,
+                    early_severity or "LOW", flow_direction,
+                )
+                benign_causes = get_benign_causes(raw_inference_summary)
+                triage_checklist = build_triage_checklist(
+                    src_ips, dst_ips, window_feature_values, is_allowlisted,
+                    self._correlation.get_count(src_ips), flow_direction,
+                )
+                asset_context = self._allowlist_ctx.format_asset_context(dst_ips, self.sanitizer)
+                should_print, suppression_notice = self._suppressor.check_and_record(raw_inference_summary, src_ips)
+                chain_warning = self._kill_chain.get_pattern_warning(src_ips)
+                if chain_warning and should_print and self.should_print_window_events():
+                    print(f"\n[!] Kill Chain Pattern: {chain_warning}")
+                if should_print and self.should_print_window_events():
                     print_detection(
                         window_end, window_feature_values, ranked_flow_summaries,
                         "suspicious", labeled_inference_summary,
@@ -604,6 +631,10 @@ class LiveTrafficMLApp:
                         alert_severity=early_severity,
                         sanitizer=self.sanitizer,
                         correlation_notice=corr_notice,
+                        confidence=confidence,
+                        fp_risk=fp_risk,
+                        suppression_notice=suppression_notice,
+                        asset_context=asset_context,
                     )
                 from src.triage import get_mitre_id
                 mitre_id = get_mitre_id(raw_inference_summary)
@@ -612,16 +643,26 @@ class LiveTrafficMLApp:
                     raw_inference_summary, early_severity or "LOW",
                     mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
                 )
+                window_time_str = f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}"
+                self._kill_chain.record(src_ips, raw_inference_summary, window_time_str, early_severity or "LOW")
+                chain_timeline = [f"[{e['time']}] {e['stage']}: {e['threat'][:60]}" for e in self._kill_chain.get_events_for_ip(src_ips[0])] if src_ips else []
                 self._alert_store.add({
                     "threat": raw_inference_summary,
                     "severity": early_severity or "LOW",
                     "mitre_id": mitre_id,
-                    "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                    "window_time": window_time_str,
                     "features": window_feature_values,
                     "flows": ranked_flow_summaries,
                     "baseline_multiples": {},
                     "src_ips": src_ips,
                     "correlation_count": self._correlation.get_count(src_ips),
+                    "confidence": confidence,
+                    "fp_risk": fp_risk,
+                    "benign_causes": benign_causes,
+                    "triage_checklist": triage_checklist,
+                    "flow_direction": flow_direction,
+                    "is_allowlisted": is_allowlisted,
+                    "chain_timeline": chain_timeline,
                 })
             else:
                 if self.should_print_window_events():
@@ -665,13 +706,34 @@ class LiveTrafficMLApp:
         alert_severity = _classify_alert_severity(window_label, raw_inference_summary)
         baseline_multiples = _get_baseline_multiples(window_feature_values, self._baseline_means) if self._baseline_means else {}
         src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+        dst_ips = list({f.destination_ip for f in ranked_flow_summaries if f.destination_ip not in {"", "unknown"}})
         corr_notice = None
+        confidence, fp_risk, benign_causes, triage_checklist = None, None, [], []
+        flow_direction, is_allowlisted, asset_context = "unknown", False, None
         if window_label == "suspicious":
             self._correlation.record(src_ips)
             corr_notice = self._correlation.notice(src_ips, self.sanitizer)
             if self._correlation.should_escalate(src_ips):
                 alert_severity = "HIGH"
-        if self.should_print_window_events():
+            flow_direction = classify_flow_direction(src_ips, dst_ips)
+            is_allowlisted = self._allowlist_ctx.any_authorized(src_ips)
+            touches_critical = self._allowlist_ctx.touches_critical_asset(dst_ips)
+            confidence, fp_risk = compute_confidence(
+                raw_inference_summary, window_feature_values, baseline_multiples,
+                self._correlation.get_count(src_ips), is_allowlisted, touches_critical,
+                alert_severity or "LOW", flow_direction,
+            )
+            benign_causes = get_benign_causes(raw_inference_summary)
+            triage_checklist = build_triage_checklist(
+                src_ips, dst_ips, window_feature_values, is_allowlisted,
+                self._correlation.get_count(src_ips), flow_direction,
+            )
+            asset_context = self._allowlist_ctx.format_asset_context(dst_ips, self.sanitizer)
+        should_print, suppression_notice = self._suppressor.check_and_record(raw_inference_summary, src_ips) if window_label == "suspicious" else (True, None)
+        chain_warning = self._kill_chain.get_pattern_warning(src_ips) if window_label == "suspicious" else None
+        if chain_warning and should_print and self.should_print_window_events():
+            print(f"\n[!] Kill Chain Pattern: {chain_warning}")
+        if (window_label != "suspicious" or should_print) and self.should_print_window_events():
             print_detection(
                 window_end, window_feature_values, ranked_flow_summaries,
                 window_label, labeled_inference_summary,
@@ -680,6 +742,10 @@ class LiveTrafficMLApp:
                 sanitizer=self.sanitizer,
                 baseline_multiples=baseline_multiples if window_label == "suspicious" else None,
                 correlation_notice=corr_notice,
+                confidence=confidence,
+                fp_risk=fp_risk,
+                suppression_notice=suppression_notice,
+                asset_context=asset_context,
             )
         if window_label == "suspicious":
             from src.triage import get_mitre_id
@@ -689,16 +755,26 @@ class LiveTrafficMLApp:
                 raw_inference_summary, alert_severity or "LOW",
                 mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
             )
+            window_time_str = f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}"
+            self._kill_chain.record(src_ips, raw_inference_summary, window_time_str, alert_severity or "LOW")
+            chain_timeline = [f"[{e['time']}] {e['stage']}: {e['threat'][:60]}" for e in self._kill_chain.get_events_for_ip(src_ips[0])] if src_ips else []
             self._alert_store.add({
                 "threat": raw_inference_summary,
                 "severity": alert_severity or "LOW",
                 "mitre_id": mitre_id,
-                "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                "window_time": window_time_str,
                 "features": window_feature_values,
                 "flows": ranked_flow_summaries,
                 "baseline_multiples": baseline_multiples,
                 "src_ips": src_ips,
                 "correlation_count": self._correlation.get_count(src_ips),
+                "confidence": confidence,
+                "fp_risk": fp_risk,
+                "benign_causes": benign_causes,
+                "triage_checklist": triage_checklist,
+                "flow_direction": flow_direction,
+                "is_allowlisted": is_allowlisted,
+                "chain_timeline": chain_timeline,
             })
         self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity, ranked_flow_summaries)
         self.memory.add_window(
@@ -718,11 +794,12 @@ class LiveTrafficMLApp:
         self.stop_event.set()
         self.capture.shutdown()
         _save_to_history(self._history_filename, self._session_windows, self._session_source)
-        print_session_summary(self._session_windows, sanitizer=self.sanitizer)
+        print_session_summary(self._session_windows, sanitizer=self.sanitizer, kill_chain_tracker=self._kill_chain)
         if self.report_path:
             write_markdown_report(
                 self.report_path, self._session_source,
-                self._session_windows, self._alert_store, sanitizer=self.sanitizer,
+                self._session_windows, self._alert_store,
+                sanitizer=self.sanitizer, kill_chain_tracker=self._kill_chain,
             )
 
 
@@ -742,6 +819,7 @@ class PcapTrafficMLApp:
         interactive,
         sanitizer=None,
         report_path=None,
+        allowlist_ctx=None,
     ):
         self.pcap_file = pcap_file
         self.window_seconds = window_seconds
@@ -756,6 +834,7 @@ class PcapTrafficMLApp:
         self.interactive_tty = self.interactive and sys.stdin.isatty()
         self.sanitizer: IpSanitizer | None = sanitizer
         self.report_path: str | None = report_path
+        self._allowlist_ctx: AllowlistContext = allowlist_ctx or AllowlistContext()
 
         self._history_filename = datetime.now().strftime("%d_%m_%Y_%H_%M_%S") + ".json"
         self._session_windows = []
@@ -764,6 +843,8 @@ class PcapTrafficMLApp:
         self._alert_store = AlertStore()
         self._correlation = _AlertCorrelation()
         self._baseline_means: dict = {}
+        self._suppressor = AlertSuppressor()
+        self._kill_chain = KillChainTracker()
         self.answer_engine = TrafficAnswerEngine(
             self.memory, local_ip=None,
             alert_store=self._alert_store, sanitizer=self.sanitizer,
@@ -863,11 +944,12 @@ class PcapTrafficMLApp:
                 print(f"    Suspicious   : {suspicious_count}")
             print(f"  CSV output     : {self.output_csv}")
             _save_to_history(self._history_filename, self._session_windows, self._session_source)
-            print_session_summary(self._session_windows, sanitizer=self.sanitizer)
+            print_session_summary(self._session_windows, sanitizer=self.sanitizer, kill_chain_tracker=self._kill_chain)
             if self.report_path:
                 write_markdown_report(
                     self.report_path, self._session_source,
-                    self._session_windows, self._alert_store, sanitizer=self.sanitizer,
+                    self._session_windows, self._alert_store,
+                    sanitizer=self.sanitizer, kill_chain_tracker=self._kill_chain,
                 )
 
         if not interrupted and self.interactive_tty:
@@ -1007,18 +1089,42 @@ class PcapTrafficMLApp:
                 labeled_inference_summary = format_inference_statement(raw_inference_summary)
                 early_severity = _classify_alert_severity(early_label, raw_inference_summary)
                 src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+                dst_ips = list({f.destination_ip for f in ranked_flow_summaries if f.destination_ip not in {"", "unknown"}})
                 self._correlation.record(src_ips)
                 corr_notice = self._correlation.notice(src_ips, self.sanitizer)
                 if self._correlation.should_escalate(src_ips):
                     early_severity = "HIGH"
-                print_detection(
-                    window_end, window_feature_values, ranked_flow_summaries,
-                    early_label, labeled_inference_summary,
-                    display_top_flows=self.display_top_flows,
-                    alert_severity=early_severity,
-                    sanitizer=self.sanitizer,
-                    correlation_notice=corr_notice,
+                flow_direction = classify_flow_direction(src_ips, dst_ips)
+                is_allowlisted = self._allowlist_ctx.any_authorized(src_ips)
+                touches_critical = self._allowlist_ctx.touches_critical_asset(dst_ips)
+                confidence, fp_risk = compute_confidence(
+                    raw_inference_summary, window_feature_values, {},
+                    self._correlation.get_count(src_ips), is_allowlisted, touches_critical,
+                    early_severity or "LOW", flow_direction,
                 )
+                benign_causes = get_benign_causes(raw_inference_summary)
+                triage_checklist = build_triage_checklist(
+                    src_ips, dst_ips, window_feature_values, is_allowlisted,
+                    self._correlation.get_count(src_ips), flow_direction,
+                )
+                asset_context = self._allowlist_ctx.format_asset_context(dst_ips, self.sanitizer)
+                should_print, suppression_notice = self._suppressor.check_and_record(raw_inference_summary, src_ips)
+                chain_warning = self._kill_chain.get_pattern_warning(src_ips)
+                if chain_warning and should_print:
+                    print(f"\n[!] Kill Chain Pattern: {chain_warning}")
+                if should_print:
+                    print_detection(
+                        window_end, window_feature_values, ranked_flow_summaries,
+                        early_label, labeled_inference_summary,
+                        display_top_flows=self.display_top_flows,
+                        alert_severity=early_severity,
+                        sanitizer=self.sanitizer,
+                        correlation_notice=corr_notice,
+                        confidence=confidence,
+                        fp_risk=fp_risk,
+                        suppression_notice=suppression_notice,
+                        asset_context=asset_context,
+                    )
                 from src.triage import get_mitre_id
                 mitre_id = get_mitre_id(raw_inference_summary)
                 write_siem_log(
@@ -1026,16 +1132,26 @@ class PcapTrafficMLApp:
                     raw_inference_summary, early_severity or "LOW",
                     mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
                 )
+                window_time_str = f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}"
+                self._kill_chain.record(src_ips, raw_inference_summary, window_time_str, early_severity or "LOW")
+                chain_timeline = [f"[{e['time']}] {e['stage']}: {e['threat'][:60]}" for e in self._kill_chain.get_events_for_ip(src_ips[0])] if src_ips else []
                 self._alert_store.add({
                     "threat": raw_inference_summary,
                     "severity": early_severity or "LOW",
                     "mitre_id": mitre_id,
-                    "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                    "window_time": window_time_str,
                     "features": window_feature_values,
                     "flows": ranked_flow_summaries,
                     "baseline_multiples": {},
                     "src_ips": src_ips,
                     "correlation_count": self._correlation.get_count(src_ips),
+                    "confidence": confidence,
+                    "fp_risk": fp_risk,
+                    "benign_causes": benign_causes,
+                    "triage_checklist": triage_checklist,
+                    "flow_direction": flow_direction,
+                    "is_allowlisted": is_allowlisted,
+                    "chain_timeline": chain_timeline,
                 })
             self._record_window(window_start, window_end, window_feature_values, 0.0, early_label, labeled_inference_summary, early_severity, ranked_flow_summaries)
             self.memory.add_window(TrafficWindow(
@@ -1060,21 +1176,48 @@ class PcapTrafficMLApp:
         alert_severity = _classify_alert_severity(window_label, raw_inference_summary)
         baseline_multiples = _get_baseline_multiples(window_feature_values, self._baseline_means) if self._baseline_means else {}
         src_ips = [f.source_ip for f in ranked_flow_summaries[:5] if f.source_ip not in {"", "unknown"}]
+        dst_ips = list({f.destination_ip for f in ranked_flow_summaries if f.destination_ip not in {"", "unknown"}})
         corr_notice = None
+        confidence, fp_risk, benign_causes, triage_checklist = None, None, [], []
+        flow_direction, is_allowlisted, asset_context = "unknown", False, None
         if window_label == "suspicious":
             self._correlation.record(src_ips)
             corr_notice = self._correlation.notice(src_ips, self.sanitizer)
             if self._correlation.should_escalate(src_ips):
                 alert_severity = "HIGH"
+            flow_direction = classify_flow_direction(src_ips, dst_ips)
+            is_allowlisted = self._allowlist_ctx.any_authorized(src_ips)
+            touches_critical = self._allowlist_ctx.touches_critical_asset(dst_ips)
+            confidence, fp_risk = compute_confidence(
+                raw_inference_summary, window_feature_values, baseline_multiples,
+                self._correlation.get_count(src_ips), is_allowlisted, touches_critical,
+                alert_severity or "LOW", flow_direction,
+            )
+            benign_causes = get_benign_causes(raw_inference_summary)
+            triage_checklist = build_triage_checklist(
+                src_ips, dst_ips, window_feature_values, is_allowlisted,
+                self._correlation.get_count(src_ips), flow_direction,
+            )
+            asset_context = self._allowlist_ctx.format_asset_context(dst_ips, self.sanitizer)
+        should_print, suppression_notice = self._suppressor.check_and_record(raw_inference_summary, src_ips) if window_label == "suspicious" else (True, None)
+        chain_warning = self._kill_chain.get_pattern_warning(src_ips) if window_label == "suspicious" else None
+        if chain_warning and should_print:
+            print(f"\n[!] Kill Chain Pattern: {chain_warning}")
+        if window_label != "suspicious" or should_print:
             print_detection(
                 window_end, window_feature_values, ranked_flow_summaries,
                 window_label, labeled_inference_summary,
                 display_top_flows=self.display_top_flows,
                 alert_severity=alert_severity,
                 sanitizer=self.sanitizer,
-                baseline_multiples=baseline_multiples,
+                baseline_multiples=baseline_multiples if window_label == "suspicious" else None,
                 correlation_notice=corr_notice,
+                confidence=confidence,
+                fp_risk=fp_risk,
+                suppression_notice=suppression_notice,
+                asset_context=asset_context,
             )
+        if window_label == "suspicious":
             from src.triage import get_mitre_id
             mitre_id = get_mitre_id(raw_inference_summary)
             write_siem_log(
@@ -1082,16 +1225,26 @@ class PcapTrafficMLApp:
                 raw_inference_summary, alert_severity or "LOW",
                 mitre_id, ranked_flow_summaries, window_feature_values.get("packets", 0),
             )
+            window_time_str = f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}"
+            self._kill_chain.record(src_ips, raw_inference_summary, window_time_str, alert_severity or "LOW")
+            chain_timeline = [f"[{e['time']}] {e['stage']}: {e['threat'][:60]}" for e in self._kill_chain.get_events_for_ip(src_ips[0])] if src_ips else []
             self._alert_store.add({
                 "threat": raw_inference_summary,
                 "severity": alert_severity or "LOW",
                 "mitre_id": mitre_id,
-                "window_time": f"{datetime.fromtimestamp(window_start).strftime('%H:%M:%S')}-{datetime.fromtimestamp(window_end).strftime('%H:%M:%S')}",
+                "window_time": window_time_str,
                 "features": window_feature_values,
                 "flows": ranked_flow_summaries,
                 "baseline_multiples": baseline_multiples,
                 "src_ips": src_ips,
                 "correlation_count": self._correlation.get_count(src_ips),
+                "confidence": confidence,
+                "fp_risk": fp_risk,
+                "benign_causes": benign_causes,
+                "triage_checklist": triage_checklist,
+                "flow_direction": flow_direction,
+                "is_allowlisted": is_allowlisted,
+                "chain_timeline": chain_timeline,
             })
         self._record_window(window_start, window_end, window_feature_values, anomaly_score, window_label, labeled_inference_summary, alert_severity, ranked_flow_summaries)
         self.memory.add_window(TrafficWindow(
@@ -1137,6 +1290,7 @@ def main():
     sanitizer = IpSanitizer() if args.sanitize else None
     if args.sanitize:
         print("[Sanitize mode] IPs and MACs will be replaced with HOST_A, HOST_B, ... in all output.")
+    allowlist_ctx = AllowlistContext()
     if args.pcap:
         app = PcapTrafficMLApp(
             pcap_file=args.pcap,
@@ -1151,6 +1305,7 @@ def main():
             interactive=not args.no_interactive,
             sanitizer=sanitizer,
             report_path=args.report,
+            allowlist_ctx=allowlist_ctx,
         )
     else:
         app = LiveTrafficMLApp(
@@ -1167,5 +1322,6 @@ def main():
             show_window_events=args.show_window_events,
             sanitizer=sanitizer,
             report_path=args.report,
+            allowlist_ctx=allowlist_ctx,
         )
     app.run()
